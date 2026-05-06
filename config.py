@@ -97,6 +97,8 @@ def parse_args() -> argparse.Namespace:
                         help="FF++ compression level, e.g. c23 (default) or c40")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--num_workers", type=int, default=None,
+                        help="DataLoader worker processes. Use 0 on Kaggle to avoid fork errors.")
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--lambda1", type=float, default=None)
     parser.add_argument("--lambda2", type=float, default=None)
