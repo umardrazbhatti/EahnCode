@@ -12,20 +12,61 @@ python run_full_pipeline.py \
     --output_dir outputs_synthetic/
 ```
 
-### Kaggle FF++ training
+### Kaggle Setup
+
+**Dataset directory layout expected on disk** (Kaggle mount):
+```
+{data_root}/
+├── manipulated_sequences/
+│   ├── Deepfakes/c23/videos/*.mp4        ← label = 1 (fake)
+│   ├── Face2Face/c23/videos/*.mp4        ← label = 1 (fake)
+│   ├── FaceShifter/c23/videos/*.mp4      ← label = 1 (fake)
+│   ├── FaceSwap/c23/videos/*.mp4         ← label = 1 (fake)
+│   └── NeuralTextures/c23/videos/*.mp4   ← label = 1 (fake)
+└── original_sequences/
+    └── youtube/c23/videos/*.mp4          ← label = 0 (real)
+```
+
+> **No mask files exist** in this dataset version.  
+> All training uses **weak supervision** (entropy + total variation loss) — `has_masks` is always `False`.
+
+**Step 1 — Verify dataset before training:**
+```bash
+python scripts/verify_dataset.py \
+    --data_root /kaggle/input/datasets/umardrazbhatti/ffpp-c23-custom-layout/ffpp_data
+```
+This prints a directory table and runs a forward pass. Exit code 0 = ready to train.
+
+**Step 2 — Train:**
 ```python
 %cd /kaggle/working
-!git clone https://github.com/umardrazbhatti/eahn_project.git
-%cd eahn_project
+!git clone https://github.com/umardrazbhatti/EahnCode.git
+%cd EahnCode
 !pip install -r requirements.txt
 
 !python run_full_pipeline.py \
     --data_root /kaggle/input/datasets/umardrazbhatti/ffpp-c23-custom-layout/ffpp_data \
     --dataset_name ff++ \
+    --dataset_compression c23 \
     --epochs 10 \
     --batch_size 4 \
     --num_workers 0 \
     --eval_after_train
+```
+
+**Expected outputs in `/kaggle/working/outputs/`:**
+```
+outputs/
+├── best_model.pth
+├── metrics.csv
+├── roc_curve.png             ← ROC curve with AUC annotation
+├── pr_curve.png              ← Precision-Recall curve with AP annotation
+├── confusion_matrix.png      ← 2×2 heatmap
+├── score_distribution.png    ← Real vs fake score histogram
+├── heatmaps/
+│   └── {video_id}_{intrinsic,gradcam,rollout,shap}.mp4
+└── explanations/
+    └── {video_id}_explanation.txt   ← Plain-English per-video report
 ```
 
 ### Evaluation only (after training)
@@ -34,12 +75,13 @@ from config import EAHNConfig
 from scripts.evaluate import run_evaluation
 
 config = EAHNConfig()
-config.data_root    = "/kaggle/input/.../ffpp_data"
-config.dataset_name = "ff++"
-config.output_dir   = "/kaggle/working/outputs"
-config.device       = "cuda"
-config.num_workers  = 0
-config.heatmap_samples = 5
+config.data_root           = "/kaggle/input/.../ffpp_data"
+config.dataset_name        = "ff++"
+config.dataset_compression = "c23"
+config.output_dir          = "/kaggle/working/outputs"
+config.device              = "cuda"
+config.num_workers         = 0
+config.heatmap_samples     = 5
 
 run_evaluation(config)
 ```

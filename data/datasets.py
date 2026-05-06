@@ -14,7 +14,7 @@ import torch
 from torch.utils.data import Dataset
 import torch.nn.functional as F
 import numpy as np
-import os, glob, json
+import os, glob, json, warnings
 from typing import Literal, List, Dict, Any
 import cv2
 
@@ -55,6 +55,15 @@ class DeepfakeDataset(Dataset):
             self._init_dfdc()
 
         if dataset_type != "synthetic":
+            labels = [s["label"] for s in self.samples]
+            n_real = labels.count(0)
+            n_fake = labels.count(1)
+            if n_real == 0 or n_fake == 0:
+                raise RuntimeError(
+                    f"Dataset has only one class: real={n_real}, fake={n_fake}. "
+                    "Both classes are required. Check data_root and directory structure."
+                )
+            print(f"[DeepfakeDataset] Class balance: real={n_real}, fake={n_fake}")
             self._apply_split()
 
     # ── dataset initialisers ───────────────────────────────────────────────────
@@ -78,28 +87,43 @@ class DeepfakeDataset(Dataset):
 
     def _init_ffpp(self):
         root = self.config.data_root
-        manip_root = os.path.join(root, "manipulated_sequences")
-        methods = ["Deepfakes", "Face2Face", "FaceShifter", "FaceSwap", "NeuralTextures"]
-        if os.path.isdir(manip_root):
-            for method in methods:
-                vdir = os.path.join(manip_root, method, "c23", "videos")
-                if not os.path.isdir(vdir):
-                    continue
-                for vpath in sorted(glob.glob(os.path.join(vdir, "*.mp4"))):
-                    mask_dir = os.path.join(
-                        root, "masks", method,
-                        os.path.splitext(os.path.basename(vpath))[0]
-                    )
-                    self.samples.append({
-                        "video_path": vpath,
-                        "label": 1,
-                        "mask_dir": mask_dir if os.path.isdir(mask_dir) else None,
-                    })
-        real_dir = os.path.join(root, "original_sequences", "youtube", "c23", "videos")
-        if os.path.isdir(real_dir):
-            for vpath in sorted(glob.glob(os.path.join(real_dir, "*.mp4"))):
-                self.samples.append({"video_path": vpath, "label": 0, "mask_dir": None})
-        self.has_masks = any(s.get("mask_dir") for s in self.samples)
+        compression = getattr(self.config, "dataset_compression", "c23")
+        MANIPULATIONS = ["Deepfakes", "Face2Face", "FaceShifter", "FaceSwap", "NeuralTextures"]
+
+        # Real videos — required; raise if missing
+        real_dir = os.path.join(root, "original_sequences", "youtube", compression, "videos")
+        if not os.path.isdir(real_dir):
+            raise FileNotFoundError(
+                f"FF++ real video directory not found: {real_dir}\n"
+                f"Expected layout: {{data_root}}/original_sequences/youtube/{compression}/videos/*.mp4"
+            )
+        n_real = 0
+        for vpath in sorted(glob.glob(os.path.join(real_dir, "*.mp4"))):
+            self.samples.append({"video_path": vpath, "label": 0, "mask_dir": None, "has_mask": False})
+            n_real += 1
+
+        # Fake videos — warn if a manipulation subdir is missing
+        n_fake = 0
+        for method in MANIPULATIONS:
+            vdir = os.path.join(root, "manipulated_sequences", method, compression, "videos")
+            if not os.path.isdir(vdir):
+                warnings.warn(
+                    f"[DeepfakeDataset] Manipulation directory not found (skipping): {vdir}"
+                )
+                continue
+            for vpath in sorted(glob.glob(os.path.join(vdir, "*.mp4"))):
+                self.samples.append({"video_path": vpath, "label": 1, "mask_dir": None, "has_mask": False})
+                n_fake += 1
+
+        if n_fake == 0:
+            raise RuntimeError(
+                "FF++ loaded zero fake videos. "
+                "Check that manipulated_sequences/ exists under data_root and contains .mp4 files."
+            )
+
+        # This dataset version has no mask files — weak supervision only
+        self.has_masks = False
+        print(f"[DeepfakeDataset] FF++ loaded: {n_real} real, {n_fake} fake")
 
     def _init_celebdf(self):
         root = os.path.join(self.config.data_root, "celeb_df")

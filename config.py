@@ -20,6 +20,7 @@ class EAHNConfig:
 
     # ── Dataset ───────────────────────────────────────────────────────────────
     dataset_name: Literal["synthetic", "ff++", "celeb_df", "dfdc"] = "ff++"
+    dataset_compression: str = "c23"
     num_frames: int = 16
     frame_size: int = 224
     train_split: float = 0.8
@@ -92,6 +93,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache_dir", type=str, default=None)
     parser.add_argument("--dataset_name", type=str, default=None,
                         choices=["synthetic", "ff++", "celeb_df", "dfdc"])
+    parser.add_argument("--dataset_compression", type=str, default=None,
+                        help="FF++ compression level, e.g. c23 (default) or c40")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)

@@ -11,6 +11,9 @@ Key fixes vs original:
      heatmap subset using metrics/explanation.py.
   5. Video reading falls back gracefully when video path is unavailable
      (synthetic dataset).
+  6. ROC, PR, confusion-matrix, score-distribution PNGs are saved.
+  7. Per-video plain-English explanation TXT files are saved.
+  8. Heatmap videos use annotated overlay with verdict text and green contour.
 """
 
 import os
@@ -28,9 +31,85 @@ from data.collate import deepfake_collate_fn
 from metrics.detection import DetectionMetrics
 from metrics.explanation import ExplanationMetrics
 from utils.checkpointing import load_checkpoint
-from utils.visualization import save_explanation_video
+from utils.visualization import save_explanation_video, generate_text_explanation
 import cv2
 
+
+# ── Detection graph helper ────────────────────────────────────────────────────
+
+def save_detection_graphs(probs, labels, output_dir: str) -> None:
+    """Save ROC curve, PR curve, confusion matrix, and score-distribution PNGs."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from sklearn.metrics import (
+        roc_curve, roc_auc_score,
+        precision_recall_curve, average_precision_score,
+        confusion_matrix,
+    )
+    import seaborn as sns
+
+    os.makedirs(output_dir, exist_ok=True)
+    probs  = np.array(probs)
+    labels = np.array(labels)
+    preds  = (probs >= 0.5).astype(int)
+
+    # 1 — ROC Curve
+    fpr, tpr, _ = roc_curve(labels, probs)
+    auc = roc_auc_score(labels, probs)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(fpr, tpr, lw=2, label=f"EAHN  AUC = {auc:.3f}")
+    ax.plot([0, 1], [0, 1], "k--", lw=1, label="Random chance")
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title("ROC Curve — Deepfake Detection (FF++ c23)")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "roc_curve.png"), dpi=150)
+    plt.close(fig)
+
+    # 2 — Precision-Recall Curve
+    prec, rec, _ = precision_recall_curve(labels, probs)
+    ap = average_precision_score(labels, probs)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(rec, prec, lw=2, color="darkorange", label=f"AP = {ap:.3f}")
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_title("Precision-Recall Curve")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "pr_curve.png"), dpi=150)
+    plt.close(fig)
+
+    # 3 — Confusion Matrix
+    cm = confusion_matrix(labels, preds)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax,
+                xticklabels=["Real", "Fake"], yticklabels=["Real", "Fake"])
+    ax.set_ylabel("Ground Truth")
+    ax.set_xlabel("Predicted")
+    ax.set_title("Confusion Matrix")
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "confusion_matrix.png"), dpi=150)
+    plt.close(fig)
+
+    # 4 — Score Distribution
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.hist(probs[labels == 0], bins=30, alpha=0.6, label="Real", color="blue")
+    ax.hist(probs[labels == 1], bins=30, alpha=0.6, label="Fake", color="red")
+    ax.axvline(0.5, color="black", linestyle="--", label="Decision threshold")
+    ax.set_xlabel("Predicted Probability (Deepfake)")
+    ax.set_ylabel("Count")
+    ax.set_title("Score Distribution")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "score_distribution.png"), dpi=150)
+    plt.close(fig)
+
+    print(f"[Evaluate] Detection graphs saved → {output_dir}")
+
+
+# ── Main evaluation entry point ───────────────────────────────────────────────
 
 def run_evaluation(config: EAHNConfig):
     device = torch.device(config.device)
@@ -70,6 +149,13 @@ def run_evaluation(config: EAHNConfig):
     det_metrics = DetectionMetrics.compute(all_probs, all_labels)
     print("Detection Metrics:", det_metrics)
 
+    # ── Save detection graphs (requires both classes) ─────────────────────────
+    labels_arr = np.array(all_labels)
+    if len(np.unique(labels_arr)) >= 2:
+        save_detection_graphs(all_probs, all_labels, config.output_dir)
+    else:
+        print("[Evaluate] Skipping detection graphs — only one class in test set.")
+
     # ── Explanation metrics on a subset ──────────────────────────────────────
     subset_size = min(config.heatmap_samples, len(test_ds))
     rng     = np.random.default_rng(42)
@@ -98,7 +184,6 @@ def run_evaluation(config: EAHNConfig):
         out         = model(frames_t)
         out.logit.backward()
         grads       = frames_t.grad.abs().mean(dim=2)  # (1, T, H, W) avg over RGB
-        # Resize to 7×7 to match M_t feature resolution
         grads_7 = torch.nn.functional.interpolate(
             grads.reshape(grads.shape[1], 1, *grads.shape[2:]),  # (T, 1, H, W)
             size=(7, 7), mode="bilinear", align_corners=False,
@@ -108,7 +193,6 @@ def run_evaluation(config: EAHNConfig):
 
     grad_maps = torch.stack(grad_maps)             # (subset, T, 7, 7)
 
-    # Average over time — (subset, 7*7) for both maps and grads
     M_sub     = all_M_t_up[indices].mean(dim=1)   # (subset, H, W)
     M_sub_7   = torch.nn.functional.interpolate(
         M_sub.unsqueeze(1), size=(7, 7), mode="bilinear", align_corners=False
@@ -124,7 +208,7 @@ def run_evaluation(config: EAHNConfig):
     # Deletion / Insertion AUC on the first heatmap sample
     del_ins = {"deletion_auc": 0.0, "insertion_auc": 0.0}
     try:
-        sample_idx = int(indices[0])
+        sample_idx    = int(indices[0])
         frames_sample = test_ds[sample_idx]["frames"].unsqueeze(0)
         sal_sample    = all_M_t_up[sample_idx].unsqueeze(0)   # (1,T,H,W)
         if isinstance(sal_sample, torch.Tensor):
@@ -136,8 +220,8 @@ def run_evaluation(config: EAHNConfig):
         print(f"  [Deletion/Insertion AUC skipped: {e}]")
 
     exp_metrics = {
-        "avg_iou":          avg_iou,
-        "temporal_ssim":    ssim_val,
+        "avg_iou":           avg_iou,
+        "temporal_ssim":     ssim_val,
         "faithfulness_corr": faithful_corr,
         **del_ins,
     }
@@ -155,7 +239,7 @@ def run_evaluation(config: EAHNConfig):
 
     # ── Heatmap generation ────────────────────────────────────────────────────
     if config.save_heatmaps:
-        _generate_heatmaps(config, model, test_ds, indices[:5], device)
+        _generate_heatmaps(config, model, test_ds, indices[:5], device, all_probs)
 
     # ── User-study stimuli ────────────────────────────────────────────────────
     try:
@@ -167,40 +251,52 @@ def run_evaluation(config: EAHNConfig):
     print("Evaluation complete. Outputs saved to", config.output_dir)
 
 
-# ── Heatmap helper ────────────────────────────────────────────────────────────
+# ── Heatmap + explanation helper ─────────────────────────────────────────────
 
-def _generate_heatmaps(config, model, test_ds, sample_indices, device):
+def _generate_heatmaps(config, model, test_ds, sample_indices, device, all_probs):
     from xai.gradcam import GradCAMExplainer
     from xai.attention_rollout import AttentionRolloutExplainer
     from xai.shap_explainer import SHAPExplainer
 
-    heatmap_dir = os.path.join(config.output_dir, "heatmaps")
+    heatmap_dir     = os.path.join(config.output_dir, "heatmaps")
+    explanation_dir = os.path.join(config.output_dir, "explanations")
     os.makedirs(heatmap_dir, exist_ok=True)
+    os.makedirs(explanation_dir, exist_ok=True)
 
     gradcam_exp = GradCAMExplainer(model, target_layer=model.spatial_stream.grad_cam_target_layer)
     rollout_exp = AttentionRolloutExplainer(model)
     shap_exp    = SHAPExplainer(model, method="integratedgrads")
 
-    print("Generating heatmaps...")
+    print("Generating heatmaps and explanations...")
     for idx in tqdm(sample_indices, desc="Saving heatmap videos"):
-        idx = int(idx)
+        idx    = int(idx)
         sample = test_ds[idx]
         frames_tensor = sample["frames"].unsqueeze(0).to(device)
 
-        # Original frames (BGR) for visualisation
+        video_path = sample["meta"].get("video_path", "")
+        video_id   = os.path.splitext(os.path.basename(video_path))[0] if video_path else str(idx)
+
         sampled_orig = _get_original_frames(
-            sample["meta"].get("video_path", ""),
-            config.num_frames, config.frame_size,
+            video_path, config.num_frames, config.frame_size,
         )
 
         with torch.no_grad():
             out = model(frames_tensor)
         intrinsic = out.M_t_up[0].cpu().numpy()   # (T, H, W)
+        prob      = float(out.prob[0].cpu())
+
+        # ── Plain-English text explanation ────────────────────────────────────
+        M_t_list = [intrinsic[t] for t in range(intrinsic.shape[0])]
+        text = generate_text_explanation(
+            prob=prob, M_t_seq=M_t_list, video_path=video_path
+        )
+        txt_path = os.path.join(explanation_dir, f"{video_id}_explanation.txt")
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(text)
 
         # Post-hoc heatmaps
         try:
-            gc_heat = gradcam_exp.explain(frames_tensor)      # (1,T,H,W)
-            gc_heat = gc_heat[0]
+            gc_heat = gradcam_exp.explain(frames_tensor)[0]   # (T,H,W)
         except Exception as e:
             print(f"  [GradCAM failed for idx {idx}: {e}]")
             gc_heat = intrinsic
@@ -217,11 +313,18 @@ def _generate_heatmaps(config, model, test_ds, sample_indices, device):
             print(f"  [SHAP failed for idx {idx}: {e}]")
             sh_heat = intrinsic
 
-        prefix = os.path.join(heatmap_dir, str(idx))
-        save_explanation_video(sampled_orig, intrinsic,  prefix + "_intrinsic.mp4")
-        save_explanation_video(sampled_orig, gc_heat,    prefix + "_gradcam.mp4")
-        save_explanation_video(sampled_orig, roll_heat,  prefix + "_rollout.mp4")
-        save_explanation_video(sampled_orig, sh_heat,    prefix + "_shap.mp4")
+        save_explanation_video(sampled_orig, intrinsic,
+                               os.path.join(heatmap_dir, f"{video_id}_intrinsic.mp4"),
+                               prob=prob)
+        save_explanation_video(sampled_orig, gc_heat,
+                               os.path.join(heatmap_dir, f"{video_id}_gradcam.mp4"),
+                               prob=prob)
+        save_explanation_video(sampled_orig, roll_heat,
+                               os.path.join(heatmap_dir, f"{video_id}_rollout.mp4"),
+                               prob=prob)
+        save_explanation_video(sampled_orig, sh_heat,
+                               os.path.join(heatmap_dir, f"{video_id}_shap.mp4"),
+                               prob=prob)
 
 
 def _get_original_frames(video_path: str, num_frames: int, frame_size: int):
@@ -229,7 +332,7 @@ def _get_original_frames(video_path: str, num_frames: int, frame_size: int):
     if not video_path or not os.path.exists(video_path):
         return [np.zeros((frame_size, frame_size, 3), np.uint8)] * num_frames
 
-    cap = cv2.VideoCapture(video_path)
+    cap   = cv2.VideoCapture(video_path)
     total = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
     idxs  = np.linspace(0, total - 1, num_frames, dtype=int)
     buf   = {}
@@ -238,7 +341,7 @@ def _get_original_frames(video_path: str, num_frames: int, frame_size: int):
         ret, frame = cap.read()
         if not ret:
             break
-        if fi in idxs:
+        if fi in set(idxs.tolist()):
             buf[fi] = cv2.resize(frame, (frame_size, frame_size))
         fi += 1
     cap.release()
