@@ -30,6 +30,16 @@ from utils.logging_utils import Logger
 def main(config: EAHNConfig):
     device = torch.device(config.device)
     print(f"Using device: {device}")
+    if device.type == "cuda":
+        cap  = torch.cuda.get_device_capability(device)
+        name = torch.cuda.get_device_name(device)
+        print(f"[Device] {name} | CUDA capability sm_{cap[0]}{cap[1]}")
+        if cap[0] < 7:
+            print(
+                f"[WARNING] sm_{cap[0]}{cap[1]} is below PyTorch minimum "
+                f"(sm_70). Switch Kaggle accelerator to T4. "
+                f"Falling back to CPU for MTCNN. AMP disabled."
+            )
     os.makedirs(config.output_dir, exist_ok=True)
 
     # ── Data ──────────────────────────────────────────────────────────────────
@@ -66,8 +76,12 @@ def main(config: EAHNConfig):
         optimizer, T_max=config.epochs, eta_min=1e-6
     )
 
-    # Mixed precision scaler (CUDA only)
-    use_amp = config.mixed_precision and device.type == "cuda"
+    # Mixed precision — requires CUDA capability sm_70+ (Volta and above)
+    use_amp = (
+        config.mixed_precision
+        and device.type == "cuda"
+        and torch.cuda.get_device_capability(device)[0] >= 7
+    )
     scaler  = GradScaler("cuda") if use_amp else None
 
     logger  = Logger(config.output_dir)

@@ -6,6 +6,7 @@ Detects on frame 0; re-detects every 5 frames; falls back to centre-crop.
 import cv2
 import numpy as np
 import os
+import warnings
 
 try:
     from facenet_pytorch import MTCNN
@@ -21,7 +22,12 @@ class FaceAligner:
         self.cache_dir = cache_dir
         self.device = device
         if _MTCNN_AVAILABLE:
-            self.mtcnn = MTCNN(keep_all=False, device=device)
+            self.mtcnn = MTCNN(
+                keep_all=False,
+                device="cpu",          # always CPU — compatible with any GPU/CUDA version
+                select_largest=True,
+                post_process=False,
+            )
         else:
             self.mtcnn = None
 
@@ -41,7 +47,11 @@ class FaceAligner:
             return self._center_crop_all(frames, output_size)
 
         first = frames[0] if isinstance(frames[0], np.ndarray) else np.array(frames[0])
-        boxes, _ = self.mtcnn.detect(first)
+        try:
+            boxes, _ = self.mtcnn.detect(first)
+        except Exception as e:
+            warnings.warn(f"[FaceAligner] MTCNN failed ({e}), using centre crop.")
+            boxes = None
         if boxes is None or len(boxes) == 0:
             return self._center_crop_all(frames, output_size)
 
@@ -49,7 +59,10 @@ class FaceAligner:
         aligned = []
         for i, img in enumerate(frames):
             if i > 0 and i % 5 == 0:
-                new_boxes, _ = self.mtcnn.detect(img)
+                try:
+                    new_boxes, _ = self.mtcnn.detect(img)
+                except Exception:
+                    new_boxes = None
                 if new_boxes is not None and len(new_boxes) > 0:
                     box_ref = new_boxes[0]
             x1, y1, x2, y2 = map(int, box_ref)
