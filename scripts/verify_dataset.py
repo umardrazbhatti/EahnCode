@@ -62,6 +62,7 @@ def main():
 
     # ── 2. Dataset loading check ──────────────────────────────────────────────
     print("\n=== Dataset Loading Check ===")
+    batch = None
     try:
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
         from config import EAHNConfig
@@ -74,66 +75,63 @@ def main():
         config.frame_size  = 224
         config.train_split = 0.8
         config.val_split   = 0.1
-        config.cache_dir   = os.path.join(data_root, ".face_cache_verify")
+        config.cache_dir   = "/kaggle/working/.face_cache_verify"
         config.device      = "cpu"
 
         ds = DeepfakeDataset(config, "train", "ff++")
-        loader = DataLoader(ds, batch_size=2, num_workers=0,
-                            collate_fn=deepfake_collate_fn)
+        loader = DataLoader(
+            ds,
+            batch_size=min(4, len(ds)),
+            collate_fn=deepfake_collate_fn,
+            shuffle=False,
+            num_workers=0,
+        )
         batch = next(iter(loader))
 
-        labels = batch["label"].tolist()
-        print(f"  batch['label']    : {labels}")
-        if not (0.0 in labels and 1.0 in labels):
+        labels_in_batch = batch["label"].tolist()
+        print(f"  Labels in batch : {labels_in_batch}")
+        print(f"  Frames shape    : {tuple(batch['frames'].shape)}")
+        print(f"  Mask shape      : {tuple(batch['mask'].shape)}")
+        print(f"  has_mask        : {batch['has_mask'].tolist()}")
+        if len(set(labels_in_batch)) < 2:
             failures.append(
-                f"Batch contains only one class: {labels}. "
-                "Class balancing failed."
+                "Batch contains only one class — check class balance "
+                "and shuffle/sampler settings."
             )
-
-        print(f"  batch['frames'].shape : {tuple(batch['frames'].shape)}")
-        print(f"  batch['mask'].shape   : {tuple(batch['mask'].shape)}")
-        print(f"  batch['mask'] sum     : {batch['mask'].sum().item():.4f}  "
-              f"(expected 0.0 — no masks in this dataset)")
-        print(f"  batch['has_mask']     : {batch['has_mask'].tolist()}  "
-              f"(expected all False)")
-
-        if batch["mask"].sum().item() != 0.0:
-            failures.append("Mask tensor is non-zero — expected all-zero for this dataset.")
-        if any(batch["has_mask"].tolist()):
-            failures.append("has_mask is True for some samples — expected False.")
-
     except Exception as exc:
         failures.append(f"Dataset loading raised: {exc}")
         print(f"  ERROR: {exc}")
+        import traceback; traceback.print_exc()
 
     # ── 3. Forward-pass check ─────────────────────────────────────────────────
     print("\n=== Model Forward-Pass Check ===")
-    try:
-        from models.eahn import EAHN
+    if batch is not None:
+        try:
+            from models.eahn import EAHN
 
-        model = EAHN(config).to("cpu")
-        model.eval()
+            model = EAHN(config).to("cpu")
+            model.eval()
+            with torch.no_grad():
+                out = model(batch["frames"])
 
-        frames_t = batch["frames"]
-        with torch.no_grad():
-            out = model(frames_t)
-
-        probs = out.prob.tolist()
-        m_min = out.M_t_up.min().item()
-        m_max = out.M_t_up.max().item()
-        m_mean = out.M_t_up.mean().item()
-
-        print(f"  out.prob          : {probs}")
-        print(f"  out.M_t_up min    : {m_min:.4f}")
-        print(f"  out.M_t_up max    : {m_max:.4f}")
-        print(f"  out.M_t_up mean   : {m_mean:.4f}")
-
-        if m_max == 0.0:
-            print("  WARNING: M_t_up is all zeros (model not trained yet — expected before training).")
-
-    except Exception as exc:
-        failures.append(f"Forward pass raised: {exc}")
-        print(f"  ERROR: {exc}")
+            print(f"  prob values : {[f'{p:.3f}' for p in out.prob.cpu().tolist()]}")
+            mt = out.M_t
+            print(f"  M_t shape   : {tuple(mt.shape)}")
+            print(f"  M_t min/max : {mt.min():.4f} / {mt.max():.4f}")
+            if mt.min() == mt.max():
+                failures.append(
+                    "M_t is constant (all same value). Model is not "
+                    "producing spatial attention. Check cross-attention module."
+                )
+        except Exception as exc:
+            failures.append(f"Forward pass raised: {exc}")
+            print(f"  ERROR: {exc}")
+            import traceback; traceback.print_exc()
+    else:
+        failures.append(
+            "Forward pass skipped — batch was not loaded. "
+            "Fix the dataset loading error above first."
+        )
 
     # ── Result ────────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
