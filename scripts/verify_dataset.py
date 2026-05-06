@@ -12,9 +12,11 @@ import glob
 import os
 import sys
 
+import random
+
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 
 def check_directory(label: str, path: str) -> tuple:
@@ -71,7 +73,6 @@ def main():
 
         config = EAHNConfig()
         config.data_root   = data_root
-        config.num_frames  = 4   # fast check
         config.frame_size  = 224
         config.train_split = 0.8
         config.val_split   = 0.1
@@ -79,24 +80,45 @@ def main():
         config.device      = "cpu"
 
         ds = DeepfakeDataset(config, "train", "ff++")
+
+        # Build a balanced subset: 2 real + 2 fake
+        real_indices = [i for i, s in enumerate(ds.samples) if s["label"] == 0]
+        fake_indices = [i for i, s in enumerate(ds.samples) if s["label"] == 1]
+
+        if len(real_indices) == 0:
+            failures.append("Zero real samples found in dataset.")
+        if len(fake_indices) == 0:
+            failures.append("Zero fake samples found in dataset.")
+
+        balanced_indices = (
+            random.sample(real_indices, min(2, len(real_indices))) +
+            random.sample(fake_indices, min(2, len(fake_indices)))
+        )
+        random.shuffle(balanced_indices)
+
+        verify_subset = Subset(ds, balanced_indices)
         loader = DataLoader(
-            ds,
-            batch_size=min(4, len(ds)),
+            verify_subset,
+            batch_size=len(balanced_indices),
             collate_fn=deepfake_collate_fn,
             shuffle=False,
             num_workers=0,
         )
         batch = next(iter(loader))
 
-        labels_in_batch = batch["label"].tolist()
+        labels_in_batch = [int(x) for x in batch["label"].tolist()]
         print(f"  Labels in batch : {labels_in_batch}")
+        n_real_in_batch = labels_in_batch.count(0)
+        n_fake_in_batch = labels_in_batch.count(1)
+        print(f"  Real in batch   : {n_real_in_batch}")
+        print(f"  Fake in batch   : {n_fake_in_batch}")
         print(f"  Frames shape    : {tuple(batch['frames'].shape)}")
         print(f"  Mask shape      : {tuple(batch['mask'].shape)}")
         print(f"  has_mask        : {batch['has_mask'].tolist()}")
-        if len(set(labels_in_batch)) < 2:
+        if n_real_in_batch == 0 or n_fake_in_batch == 0:
             failures.append(
-                "Batch contains only one class — check class balance "
-                "and shuffle/sampler settings."
+                f"Batch is unbalanced: real={n_real_in_batch}, "
+                f"fake={n_fake_in_batch}. Sampler or shuffle may be broken."
             )
     except Exception as exc:
         failures.append(f"Dataset loading raised: {exc}")

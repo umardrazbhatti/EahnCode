@@ -12,7 +12,7 @@ import os
 import torch
 import numpy as np
 from tqdm import tqdm
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.amp import GradScaler, autocast
 
 from config import EAHNConfig, parse_args
@@ -37,8 +37,17 @@ def main(config: EAHNConfig):
     val_ds   = DeepfakeDataset(config, "val",   config.dataset_name)
     print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
 
+    train_labels   = [s["label"] for s in train_ds.samples]
+    class_counts   = [train_labels.count(0), train_labels.count(1)]
+    class_weights  = [1.0 / c for c in class_counts]
+    sample_weights = [class_weights[lbl] for lbl in train_labels]
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
     train_loader = DataLoader(
-        train_ds, batch_size=config.batch_size, shuffle=True,
+        train_ds, batch_size=config.batch_size, sampler=sampler,
         num_workers=config.num_workers, collate_fn=deepfake_collate_fn,
         drop_last=True, pin_memory=(device.type == "cuda"),
     )
