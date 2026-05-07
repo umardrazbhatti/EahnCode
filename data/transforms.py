@@ -1,20 +1,55 @@
 """
-data/transforms.py — augmentation and normalisation pipelines.
-Augmentations operate on [0,1] float tensors (C,H,W).
+data/transforms.py
+==================
+Provides get_transforms(mode, frame_size) used by DeepfakeDataset.__getitem__.
+
+Train : random horizontal flip + colour jitter + Gaussian blur + ImageNet normalisation
+Val / Test : centre-crop resize + ImageNet normalisation only
 """
 
-import torchvision.transforms as T
+from torchvision import transforms
 
 
-def get_augmentation_transforms() -> T.Compose:
-    """Random augmentations applied per-frame during training."""
-    return T.Compose([
-        T.RandomHorizontalFlip(p=0.5),
-        T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
-        T.RandomApply([T.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))], p=0.3),
-    ])
+# ImageNet statistics — used for EfficientNet-B4 pre-trained weights
+_MEAN = [0.485, 0.456, 0.406]
+_STD  = [0.229, 0.224, 0.225]
 
 
-def get_normalization_transform() -> T.Normalize:
-    """ImageNet normalisation for [0,1] tensors."""
-    return T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+def get_transforms(mode: str, frame_size: int = 224):
+    """
+    Return a torchvision transform pipeline for the given split.
+
+    Parameters
+    ----------
+    mode : str
+        One of 'train', 'val', or 'test'.
+    frame_size : int
+        Target spatial resolution (height == width). Default 224.
+
+    Returns
+    -------
+    torchvision.transforms.Compose
+        A callable that accepts a PIL Image and returns a normalised float32 tensor
+        of shape (3, frame_size, frame_size).
+    """
+    if mode == "train":
+        return transforms.Compose([
+            transforms.Resize((frame_size, frame_size)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(
+                brightness=0.2,
+                contrast=0.2,
+                saturation=0.2,
+                hue=0.05,
+            ),
+            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=_MEAN, std=_STD),
+        ])
+    else:
+        # val and test: deterministic resize + normalise only
+        return transforms.Compose([
+            transforms.Resize((frame_size, frame_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=_MEAN, std=_STD),
+        ])
