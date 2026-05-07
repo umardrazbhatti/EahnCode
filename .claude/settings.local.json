@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\Admin\\\\Desktop\\\\EahnCode\" -Directory)",
+      "Bash(Select-Object Name)",
+      "Bash(python -c ' *)"
+    ]
+  }
+}
