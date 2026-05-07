@@ -9,6 +9,7 @@ Fixes vs original:
 """
 
 import os
+import math
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -88,7 +89,7 @@ def main(config: EAHNConfig):
 
     # ── Resume ────────────────────────────────────────────────────────────────
     start_epoch = 0
-    best_auc    = 0.0
+    best_auc    = -1.0
     if config.resume_checkpoint and os.path.exists(config.resume_checkpoint):
         ckpt = load_checkpoint(config.resume_checkpoint, model, optimizer, scheduler)
         start_epoch = ckpt.get("epoch", 0) + 1
@@ -172,12 +173,16 @@ def main(config: EAHNConfig):
         )
 
         # Save best
-        auc = metrics["auc_roc"] if not np.isnan(metrics["auc_roc"]) else 0.0
-        if auc > best_auc:
-            best_auc = auc
+        val_auc = metrics.get("auc_roc", float("nan"))
+        if not math.isnan(val_auc) and val_auc > best_auc:
+            best_auc = val_auc
             save_checkpoint(model, optimizer, scheduler, epoch, best_auc,
                             config, ckpt_path)
-            print(f"  --> Best model saved (AUC-ROC: {best_auc:.3f})")
+            print(f"  --> Best model saved (AUC-ROC: {best_auc:.4f})")
+
+        # Always save a per-epoch fallback checkpoint
+        last_ckpt = os.path.join(config.output_dir, f"checkpoint_epoch{epoch:03d}.pth")
+        save_checkpoint(model, optimizer, scheduler, epoch, val_auc, config, last_ckpt)
 
     logger.close()
     print(f"\nTraining complete. Best AUC-ROC: {best_auc:.4f}")

@@ -118,7 +118,18 @@ def run_evaluation(config: EAHNConfig):
     model     = EAHN(config).to(device)
     ckpt_path = os.path.join(config.output_dir, "best_model.pth")
     if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        import glob as _glob
+        candidates = sorted(_glob.glob(
+            os.path.join(config.output_dir, "checkpoint_epoch*.pth")
+        ))
+        if candidates:
+            ckpt_path = candidates[-1]
+            print(f"[Eval] best_model.pth not found — using {ckpt_path}")
+        else:
+            raise FileNotFoundError(
+                f"No checkpoint found in {config.output_dir}. "
+                "Did training complete without errors?"
+            )
     load_checkpoint(ckpt_path, model)
     model.eval()
     print("Loaded best model for evaluation.")

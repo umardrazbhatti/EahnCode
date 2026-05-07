@@ -10,6 +10,7 @@ Key fixes vs original:
   - Synthetic mode returns the mask resized to match the spatial grid.
 """
 
+import random
 import torch
 from torch.utils.data import Dataset
 import torch.nn.functional as F
@@ -147,15 +148,34 @@ class DeepfakeDataset(Dataset):
         self.has_masks = False
 
     def _apply_split(self):
-        n = len(self.samples)
-        train_end = int(self.config.train_split * n)
-        val_end   = int((self.config.train_split + self.config.val_split) * n)
-        if self.mode == "train":
-            self.samples = self.samples[:train_end]
-        elif self.mode == "val":
-            self.samples = self.samples[train_end:val_end]
-        else:
-            self.samples = self.samples[val_end:]
+        train_ratio = self.config.train_split
+        val_ratio   = self.config.val_split
+
+        rng  = random.Random(42)
+        real = [s for s in self.samples if s["label"] == 0]
+        fake = [s for s in self.samples if s["label"] == 1]
+        rng.shuffle(real)
+        rng.shuffle(fake)
+
+        def _split(lst):
+            n       = len(lst)
+            n_train = int(n * train_ratio)
+            n_val   = int(n * val_ratio)
+            return lst[:n_train], lst[n_train:n_train + n_val], lst[n_train + n_val:]
+
+        r_tr, r_va, r_te = _split(real)
+        f_tr, f_va, f_te = _split(fake)
+
+        train = r_tr + f_tr;  rng.shuffle(train)
+        val   = r_va + f_va;  rng.shuffle(val)
+        test  = r_te + f_te;  rng.shuffle(test)
+
+        print(f"[Split] Train  real={len(r_tr)} fake={len(f_tr)}")
+        print(f"[Split] Val    real={len(r_va)} fake={len(f_va)}")
+        print(f"[Split] Test   real={len(r_te)} fake={len(f_te)}")
+
+        split_map = {"train": train, "val": val, "test": test}
+        self.samples = split_map[self.mode]
 
     # ── Dataset interface ─────────────────────────────────────────────────────
 
