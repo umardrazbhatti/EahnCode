@@ -1,316 +1,423 @@
 """
-data/datasets.py — DeepfakeDataset supporting FF++, Celeb-DF, DFDC and Synthetic modes.
+data/datasets.py  —  EAHN DeepfakeDataset
+==========================================
+Corrected path conventions for the actual Kaggle FF++ c23 layout:
 
-Key fixes vs original:
-  - Mask resize target is (7,7) which matches the feature map h×w for EfficientNet-B4/B0,
-    averaged over time → (7,7) ground-truth mask used in L_exp.
-  - Augmentation is applied before normalisation; applied per-frame on (C,H,W) tensor.
-  - Mask shape returned is (7,7) always — consistent with M_t grid size in EAHN.
-  - has_mask is returned as a bool scalar tensor.
-  - Synthetic mode returns the mask resized to match the spatial grid.
+  Fake: {data_root}/manipulated_sequences/{Method}/c23/videos/*.mp4   (label=1)
+  Real: {data_root}/original_sequences/youtube/c23/videos/*.mp4       (label=0)
+
+No pixel-level manipulation masks exist in this dataset snapshot,
+so has_masks=False and weakly-supervised L_exp is applied throughout.
+
+Class balance fix: 5 methods × 1000 fakes = 5000 fakes vs 1000 reals.
+Undersampling fakes to a max 2:1 ratio (2000 fakes : 1000 reals = 3000 total)
+before splitting, which ensures both classes appear in every split.
 """
 
+import os
+import json
 import random
-import torch
-from torch.utils.data import Dataset
-import torch.nn.functional as F
-import numpy as np
-import os, glob, json, warnings
-from typing import Literal, List, Dict, Any
-import cv2
+import warnings
+from typing import Literal
 
-from config import EAHNConfig
+import cv2
+import numpy as np
+import torch
+from PIL import Image
+from torch.utils.data import Dataset
+
+try:
+    from decord import VideoReader, cpu as decord_cpu
+    DECORD_AVAILABLE = True
+except ImportError:
+    DECORD_AVAILABLE = False
+    warnings.warn(
+        "decord not available; falling back to OpenCV for video reading. "
+        "Install with: pip install decord"
+    )
+
 from data.face_align import FaceAligner
-from data.transforms import get_augmentation_transforms, get_normalization_transform
+from data.transforms import get_transforms
 from data.synthetic_generator import SyntheticDataGenerator
 
-# Feature map resolution for EfficientNet-B4/B0 on 224×224 input → 7×7
-_MASK_GRID = 7
+# ---------------------------------------------------------------------------
+# FF++ manipulation methods present in this dataset snapshot
+# ---------------------------------------------------------------------------
+FF_METHODS = [
+    "Deepfakes",
+    "Face2Face",
+    "FaceShifter",
+    "FaceSwap",
+    "NeuralTextures",
+]
 
 
 class DeepfakeDataset(Dataset):
+    """
+    Unified dataset loader for FF++, Celeb-DF, DFDC and synthetic data.
+
+    Each __getitem__ returns a dict with keys:
+        frames    : Tensor (T, 3, H, W)  — normalised face-aligned frames
+        label     : int                  — 0 = real, 1 = fake
+        mask      : Tensor (h, w)        — manipulation mask or zeros
+        has_mask  : bool                 — whether mask is a real GT mask
+        meta      : dict                 — video_path, frame_indices
+    """
+
     def __init__(
         self,
-        config: EAHNConfig,
+        config,
         mode: Literal["train", "val", "test"],
         dataset_type: Literal["synthetic", "ff++", "celeb_df", "dfdc"],
     ):
         self.config = config
         self.mode = mode
         self.dataset_type = dataset_type
+        self.transform = get_transforms(mode, config.frame_size)
+        self.has_masks: bool = False
+        self.samples: list[dict] = []
+
+        # Face aligner — shared across all dataset types
         self.face_aligner = FaceAligner(
-            margin=0.3, cache_dir=config.cache_dir, device=config.device
+            margin=0.30,
+            cache_dir=getattr(config, "cache_dir", None),
+            device=config.device,
         )
-        self.aug_transform  = get_augmentation_transforms() if mode == "train" else None
-        self.norm           = get_normalization_transform()
-        self.has_masks      = False
-        self.samples: List[Dict[str, Any]] = []
 
+        # ── Build sample list ────────────────────────────────────────────
         if dataset_type == "synthetic":
-            self._init_synthetic()
+            self._build_synthetic()
         elif dataset_type == "ff++":
-            self._init_ffpp()
+            self._build_ffpp()
         elif dataset_type == "celeb_df":
-            self._init_celebdf()
+            self._build_celeb_df()
         elif dataset_type == "dfdc":
-            self._init_dfdc()
+            self._build_dfdc()
+        else:
+            raise ValueError(f"Unknown dataset_type: '{dataset_type}'")
 
-        if dataset_type != "synthetic":
-            labels = [s["label"] for s in self.samples]
-            n_real = labels.count(0)
-            n_fake = labels.count(1)
-            if n_real == 0 or n_fake == 0:
-                raise RuntimeError(
-                    f"Dataset has only one class: real={n_real}, fake={n_fake}. "
-                    "Both classes are required. Check data_root and directory structure."
-                )
-            print(f"[DeepfakeDataset] Class balance: real={n_real}, fake={n_fake}")
-            self._apply_split()
+        # ── Train / val / test split ────────────────────────────────────
+        self.samples = self._split(
+            self.samples, mode, config.train_split, config.val_split
+        )
 
-    # ── dataset initialisers ───────────────────────────────────────────────────
-
-    def _init_synthetic(self):
-        gen = SyntheticDataGenerator(seed=42)
-        all_samples = []
-        for i in range(200):
-            frames, label, mask = gen.generate_sequence(
-                num_frames=self.config.num_frames,
-                frame_size=(self.config.frame_size, self.config.frame_size),
+        if len(self.samples) == 0:
+            raise RuntimeError(
+                f"[DeepfakeDataset] No samples found for "
+                f"dataset='{dataset_type}', mode='{mode}'. "
+                f"Check config.data_root='{config.data_root}'."
             )
-            all_samples.append({
-                "frames": frames, "label": label,
-                "mask": mask, "has_mask": True, "meta": {"id": i},
-            })
-        splits = {"train": all_samples[:160], "val": all_samples[160:180],
-                  "test": all_samples[180:]}
-        self.samples = splits[self.mode]
-        self.has_masks = True
 
-    def _init_ffpp(self):
+        # ── Log class distribution ──────────────────────────────────────
+        n_real = sum(1 for s in self.samples if s["label"] == 0)
+        n_fake = sum(1 for s in self.samples if s["label"] == 1)
+        print(
+            f"[DeepfakeDataset | {dataset_type} / {mode}] "
+            f"total={len(self.samples)}  real={n_real}  fake={n_fake}"
+        )
+
+    # ====================================================================
+    # Dataset builders
+    # ====================================================================
+
+    def _build_ffpp(self):
+        """
+        Scans the actual FF++ c23 directory layout.
+
+        Relative to config.data_root (= .../ffpp_data/):
+            Fake: manipulated_sequences/{Method}/c23/videos/*.mp4
+            Real: original_sequences/youtube/c23/videos/*.mp4
+        """
         root = self.config.data_root
-        compression = getattr(self.config, "dataset_compression", "c23")
-        MANIPULATIONS = ["Deepfakes", "Face2Face", "FaceShifter", "FaceSwap", "NeuralTextures"]
 
-        # Real videos — required; raise if missing
-        real_dir = os.path.join(root, "original_sequences", "youtube", compression, "videos")
-        if not os.path.isdir(real_dir):
-            raise FileNotFoundError(
-                f"FF++ real video directory not found: {real_dir}\n"
-                f"Expected layout: {{data_root}}/original_sequences/youtube/{compression}/videos/*.mp4"
+        # ── Real videos (label = 0) ──────────────────────────────────────
+        real_dir = os.path.join(
+            root, "original_sequences", "youtube", "c23", "videos"
+        )
+        real_paths = self._glob_mp4(real_dir)
+        if not real_paths:
+            warnings.warn(
+                f"[FF++] No real videos found at: {real_dir}\n"
+                "Check that config.data_root points to the ffpp_data/ folder."
             )
-        n_real = 0
-        for vpath in sorted(glob.glob(os.path.join(real_dir, "*.mp4"))):
-            self.samples.append({"video_path": vpath, "label": 0, "mask_dir": None, "has_mask": False})
-            n_real += 1
+        for p in real_paths:
+            self.samples.append(
+                {"video_path": p, "label": 0, "mask_path": None}
+            )
 
-        # Fake videos — warn if a manipulation subdir is missing
-        n_fake = 0
-        for method in MANIPULATIONS:
-            vdir = os.path.join(root, "manipulated_sequences", method, compression, "videos")
-            if not os.path.isdir(vdir):
+        # ── Fake videos (label = 1) ──────────────────────────────────────
+        for method in FF_METHODS:
+            fake_dir = os.path.join(
+                root, "manipulated_sequences", method, "c23", "videos"
+            )
+            fake_paths = self._glob_mp4(fake_dir)
+            if not fake_paths:
                 warnings.warn(
-                    f"[DeepfakeDataset] Manipulation directory not found (skipping): {vdir}"
+                    f"[FF++] No fake videos found for method '{method}' at: {fake_dir}"
                 )
                 continue
-            for vpath in sorted(glob.glob(os.path.join(vdir, "*.mp4"))):
-                self.samples.append({"video_path": vpath, "label": 1, "mask_dir": None, "has_mask": False})
-                n_fake += 1
+            for p in fake_paths:
+                self.samples.append(
+                    {"video_path": p, "label": 1, "mask_path": None}
+                )
 
-        if n_fake == 0:
-            raise RuntimeError(
-                "FF++ loaded zero fake videos. "
-                "Check that manipulated_sequences/ exists under data_root and contains .mp4 files."
+        # ── Mask detection ───────────────────────────────────────────────
+        # This dataset snapshot contains no mask directories.
+        # Check anyway so the code is forward-compatible if masks are added.
+        possible_mask_root = os.path.join(
+            root, "manipulated_sequences", "FaceSwap", "c23", "masks"
+        )
+        self.has_masks = os.path.isdir(possible_mask_root)
+        if self.has_masks:
+            print("[FF++] Pixel-level masks found → supervised L_exp will be used.")
+        else:
+            print("[FF++] No pixel-level masks found → weakly-supervised L_exp (entropy + TV).")
+
+        # ── Balance classes ──────────────────────────────────────────────
+        # 5 methods × ~1000 fakes = ~5000 fakes vs ~1000 reals → 5:1 ratio.
+        # Cap fakes at 2× the number of reals before splitting.
+        self._balance_classes(max_fake_ratio=2.0)
+
+    def _build_celeb_df(self):
+        """
+        Expected layout relative to config.data_root:
+            videos/real/*.mp4
+            videos/synthesis/*.mp4
+        No pixel-level masks available.
+        """
+        root = self.config.data_root
+        real_dir = os.path.join(root, "videos", "real")
+        fake_dir = os.path.join(root, "videos", "synthesis")
+        for p in self._glob_mp4(real_dir):
+            self.samples.append({"video_path": p, "label": 0, "mask_path": None})
+        for p in self._glob_mp4(fake_dir):
+            self.samples.append({"video_path": p, "label": 1, "mask_path": None})
+        self.has_masks = False
+        self._balance_classes(max_fake_ratio=2.0)
+
+    def _build_dfdc(self):
+        """
+        Expected layout relative to config.data_root:
+            dfdc_train_part_*/videos/*.mp4
+            dfdc_train_part_*/metadata.json
+        """
+        root = self.config.data_root
+        for part in sorted(os.listdir(root)):
+            if not part.startswith("dfdc_train_part"):
+                continue
+            part_dir = os.path.join(root, part)
+            if not os.path.isdir(part_dir):
+                continue
+            meta_path = os.path.join(part_dir, "metadata.json")
+            if not os.path.exists(meta_path):
+                warnings.warn(f"[DFDC] metadata.json not found in: {part_dir}")
+                continue
+            with open(meta_path) as f:
+                meta = json.load(f)
+            for fname, info in meta.items():
+                vpath = os.path.join(part_dir, "videos", fname)
+                if not os.path.exists(vpath):
+                    continue
+                label = 1 if info.get("label") == "FAKE" else 0
+                self.samples.append(
+                    {"video_path": vpath, "label": label, "mask_path": None}
+                )
+        self.has_masks = False
+        self._balance_classes(max_fake_ratio=2.0)
+
+    def _build_synthetic(self):
+        """
+        Synthetic data: generated entirely in RAM, no disk I/O.
+        Always produces masks, enabling supervised L_exp testing.
+        """
+        self.has_masks = True
+        self.generator = SyntheticDataGenerator()
+        n_total = 200  # 100 real + 100 fake
+        for i in range(n_total):
+            label = i % 2
+            self.samples.append(
+                {"video_path": f"synthetic_{i}", "label": label, "mask_path": None}
             )
 
-        # This dataset version has no mask files — weak supervision only
-        self.has_masks = False
-        print(f"[DeepfakeDataset] FF++ loaded: {n_real} real, {n_fake} fake")
+    # ====================================================================
+    # Helpers
+    # ====================================================================
 
-    def _init_celebdf(self):
-        root = os.path.join(self.config.data_root, "celeb_df")
-        for vpath in sorted(glob.glob(os.path.join(root, "videos", "real", "*.mp4"))):
-            self.samples.append({"video_path": vpath, "label": 0, "mask_dir": None})
-        for vpath in sorted(glob.glob(os.path.join(root, "videos", "synthesis", "*.mp4"))):
-            self.samples.append({"video_path": vpath, "label": 1, "mask_dir": None})
-        self.has_masks = False
+    @staticmethod
+    def _glob_mp4(directory: str) -> list[str]:
+        """Returns sorted list of .mp4 paths in a directory."""
+        if not os.path.isdir(directory):
+            return []
+        return sorted(
+            os.path.join(directory, f)
+            for f in os.listdir(directory)
+            if f.lower().endswith(".mp4")
+        )
 
-    def _init_dfdc(self):
-        root = os.path.join(self.config.data_root, "dfdc")
-        meta_path = os.path.join(root, "metadata.json")
-        if os.path.exists(meta_path):
-            metadata = json.load(open(meta_path))
-            for video_name, info in metadata.items():
-                self.samples.append({
-                    "video_path": os.path.join(root, "videos", video_name),
-                    "label": 1 if info["label"] == "FAKE" else 0,
-                    "mask_dir": None,
-                })
-        self.has_masks = False
-
-    def _apply_split(self):
-        train_ratio = self.config.train_split
-        val_ratio   = self.config.val_split
-
-        rng  = random.Random(42)
+    def _balance_classes(self, max_fake_ratio: float = 2.0):
+        """
+        Undersample fakes so that len(fakes) / len(reals) <= max_fake_ratio.
+        Uses a fixed seed for reproducibility across runs.
+        """
         real = [s for s in self.samples if s["label"] == 0]
         fake = [s for s in self.samples if s["label"] == 1]
-        rng.shuffle(real)
-        rng.shuffle(fake)
 
-        def _split(lst):
-            n       = len(lst)
-            n_train = int(n * train_ratio)
-            n_val   = int(n * val_ratio)
-            return lst[:n_train], lst[n_train:n_train + n_val], lst[n_train + n_val:]
+        if not real or not fake:
+            warnings.warn(
+                "[DeepfakeDataset] One class is missing entirely before balancing. "
+                f"real={len(real)}, fake={len(fake)}. "
+                "Check that video files exist at the expected paths."
+            )
+            return
 
-        r_tr, r_va, r_te = _split(real)
-        f_tr, f_va, f_te = _split(fake)
+        max_fake = int(len(real) * max_fake_ratio)
+        if len(fake) > max_fake:
+            rng = random.Random(42)
+            fake = rng.sample(fake, max_fake)
+            print(
+                f"[DeepfakeDataset] Undersampled fakes from {len(fake) + (len(fake) - max_fake)} "
+                f"to {max_fake} (ratio {max_fake_ratio}:1 vs {len(real)} reals)."
+            )
 
-        train = r_tr + f_tr;  rng.shuffle(train)
-        val   = r_va + f_va;  rng.shuffle(val)
-        test  = r_te + f_te;  rng.shuffle(test)
+        combined = real + fake
+        random.Random(42).shuffle(combined)
+        self.samples = combined
 
-        print(f"[Split] Train  real={len(r_tr)} fake={len(f_tr)}")
-        print(f"[Split] Val    real={len(r_va)} fake={len(f_va)}")
-        print(f"[Split] Test   real={len(r_te)} fake={len(f_te)}")
+    @staticmethod
+    def _split(
+        samples: list,
+        mode: str,
+        train_frac: float,
+        val_frac: float,
+    ) -> list:
+        """
+        Deterministic 80/10/10 split (or as configured).
+        Shuffled with seed=0 before splitting to ensure reproducibility.
+        """
+        data = samples[:]
+        random.Random(0).shuffle(data)
+        n = len(data)
+        n_train = int(n * train_frac)
+        n_val = int(n * val_frac)
+        if mode == "train":
+            return data[:n_train]
+        elif mode == "val":
+            return data[n_train: n_train + n_val]
+        else:  # test
+            return data[n_train + n_val:]
 
-        split_map = {"train": train, "val": val, "test": test}
-        self.samples = split_map[self.mode]
-
-    # ── Dataset interface ─────────────────────────────────────────────────────
+    # ====================================================================
+    # Core Dataset interface
+    # ====================================================================
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
+    def __getitem__(self, idx: int) -> dict:
         sample = self.samples[idx]
 
+        # ── Synthetic: generate on-the-fly ──────────────────────────────
         if self.dataset_type == "synthetic":
-            return self._getitem_synthetic(sample)
-        return self._getitem_video(sample)
-
-    # ── synthetic item ────────────────────────────────────────────────────────
-
-    def _getitem_synthetic(self, sample: dict) -> dict:
-        frames = sample["frames"]          # (T, 3, H, W) float [0,1], unnormalised
-        label  = sample["label"]
-        mask   = sample["mask"]            # (H, W) float
-
-        # Augment each frame
-        if self.aug_transform is not None:
-            frames = torch.stack([self.aug_transform(frames[t]) for t in range(frames.shape[0])])
-
-        frames = torch.stack([self.norm(frames[t]) for t in range(frames.shape[0])])
-
-        # Resize mask to spatial grid used by EAHN
-        mask_grid = F.interpolate(
-            mask.unsqueeze(0).unsqueeze(0),
-            size=(_MASK_GRID, _MASK_GRID), mode="area"
-        ).squeeze()  # (_MASK_GRID, _MASK_GRID)
-
-        return {
-            "frames":   frames,
-            "label":    torch.tensor(label, dtype=torch.float),
-            "mask":     mask_grid,
-            "has_mask": torch.tensor(True, dtype=torch.bool),
-            "meta":     sample.get("meta", {}),
-        }
-
-    # ── video item ────────────────────────────────────────────────────────────
-
-    def _getitem_video(self, sample: dict) -> dict:
-        video_path = sample["video_path"]
-        label      = sample["label"]
-        T          = self.config.num_frames
-        H = W      = self.config.frame_size
-
-        # ── Read frames ───────────────────────────────────────────────────────
-        raw_frames, indices = self._read_video(video_path, T)
-
-        # ── Face alignment ────────────────────────────────────────────────────
-        aligned = self.face_aligner.align_frames(
-            raw_frames, video_id=os.path.basename(video_path), output_size=H
-        )
-
-        # ── To tensor [0,1] → augment → normalise ────────────────────────────
-        frames = torch.from_numpy(
-            np.stack(aligned).astype(np.float32)
-        ).permute(0, 3, 1, 2) / 255.0     # (T, 3, H, W)
-
-        if self.aug_transform is not None:
-            frames = torch.stack([self.aug_transform(frames[t]) for t in range(T)])
-        frames = torch.stack([self.norm(frames[t]) for t in range(T)])
-
-        # ── Load mask ─────────────────────────────────────────────────────────
-        has_mask  = False
-        mask_grid = torch.zeros(_MASK_GRID, _MASK_GRID, dtype=torch.float)
-
-        if sample.get("mask_dir"):
-            mask_grid, has_mask = self._load_mask(
-                sample["mask_dir"], indices, H, _MASK_GRID
+            seed = int(sample["video_path"].split("_")[1])
+            frames, label, mask_full = self.generator.generate_sequence(
+                num_frames=self.config.num_frames,
+                frame_size=(self.config.frame_size, self.config.frame_size),
+                seed=seed,
             )
+            # Downsample mask to backbone stride (7×7 for 224px input at stride 32)
+            h = w = self.config.frame_size // 32
+            mask_np = mask_full.numpy() if hasattr(mask_full, "numpy") else mask_full
+            mask_small = torch.tensor(
+                cv2.resize(mask_np.astype(np.float32), (w, h)),
+                dtype=torch.float32,
+            )
+            return {
+                "frames":   frames,
+                "label":    label,
+                "mask":     mask_small,
+                "has_mask": True,
+                "meta":     {"video_path": sample["video_path"], "frame_indices": []},
+            }
+
+        # ── Real datasets: read from disk ────────────────────────────────
+        frames_np = self._read_frames(sample["video_path"])
+
+        # Face alignment (uses cache if cache_dir is set)
+        video_id = os.path.splitext(os.path.basename(sample["video_path"]))[0]
+        frames_np = self.face_aligner.align_frames(frames_np, video_id)
+
+        # Convert to tensor via transform
+        frames_tensor = torch.stack(
+            [self.transform(Image.fromarray(f)) for f in frames_np]
+        )  # shape: (T, 3, H, W)
+
+        # ── Mask ─────────────────────────────────────────────────────────
+        h = w = self.config.frame_size // 32  # 7 for 224px at stride 32
+        if (
+            self.has_masks
+            and sample["mask_path"]
+            and os.path.exists(sample["mask_path"])
+        ):
+            mask_img = cv2.imread(sample["mask_path"], cv2.IMREAD_GRAYSCALE)
+            mask_img = cv2.resize(mask_img, (w, h)).astype(np.float32) / 255.0
+            mask = torch.tensor(mask_img, dtype=torch.float32)
+            has_mask = True
+        else:
+            mask = torch.zeros(h, w, dtype=torch.float32)
+            has_mask = False
 
         return {
-            "frames":   frames,
-            "label":    torch.tensor(label, dtype=torch.float),
-            "mask":     mask_grid,
-            "has_mask": torch.tensor(has_mask, dtype=torch.bool),
-            "meta":     {"video_path": video_path},
+            "frames":   frames_tensor,
+            "label":    sample["label"],
+            "mask":     mask,
+            "has_mask": has_mask,
+            "meta": {
+                "video_path":    sample["video_path"],
+                "frame_indices": [],
+            },
         }
 
-    # ── helpers ───────────────────────────────────────────────────────────────
+    def _read_frames(self, video_path: str) -> list[np.ndarray]:
+        """
+        Uniformly samples config.num_frames frames from a video file.
+        Tries decord first (faster); falls back to OpenCV.
+        Returns a list of (H, W, 3) uint8 RGB arrays.
+        """
+        T = self.config.num_frames
 
-    @staticmethod
-    def _read_video(video_path: str, num_frames: int):
-        """Read T frames uniformly sampled from the video. Returns list of np arrays."""
-        try:
-            import decord
-            vr = decord.VideoReader(video_path)
-            total = len(vr)
-            indices = np.linspace(0, total - 1, num_frames, dtype=int)
-            frames = [vr[int(i)].asnumpy() for i in indices]
-        except Exception:
-            cap = cv2.VideoCapture(video_path)
-            total = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
-            indices = np.linspace(0, total - 1, num_frames, dtype=int)
-            idx_set = set(indices.tolist())
-            frames = []
-            buf = {}
-            fi = 0
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                if fi in idx_set:
-                    buf[fi] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                fi += 1
-            cap.release()
-            frames = [buf.get(i, np.zeros((224, 224, 3), np.uint8)) for i in indices]
+        if DECORD_AVAILABLE:
+            try:
+                vr = VideoReader(video_path, ctx=decord_cpu(0))
+                total = len(vr)
+                indices = np.linspace(0, total - 1, T, dtype=int).tolist()
+                batch = vr.get_batch(indices).asnumpy()  # (T, H, W, 3) RGB
+                return [batch[i] for i in range(T)]
+            except Exception as exc:
+                warnings.warn(
+                    f"decord failed on '{video_path}': {exc}. Using OpenCV fallback."
+                )
 
-        return frames, indices
+        # ── OpenCV fallback ──────────────────────────────────────────────
+        cap = cv2.VideoCapture(video_path)
+        total = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 1)
+        target_indices = set(np.linspace(0, total - 1, T, dtype=int).tolist())
+        frames: list[np.ndarray] = []
+        fi = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if fi in target_indices:
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            fi += 1
+            if len(frames) == T:
+                break
+        cap.release()
 
-    @staticmethod
-    def _load_mask(mask_dir: str, frame_indices, frame_size: int,
-                   grid_size: int):
-        """Load per-frame masks, average over frames, return (grid_size,grid_size) tensor."""
-        mask_frames = []
-        for fi in frame_indices:
-            mpath = os.path.join(mask_dir, f"{fi:04d}.png")
-            if os.path.exists(mpath):
-                mimg = cv2.imread(mpath, cv2.IMREAD_GRAYSCALE)
-                if mimg is None:
-                    mimg = np.zeros((frame_size, frame_size), np.uint8)
-                mimg = cv2.resize(mimg, (frame_size, frame_size))
-            else:
-                mimg = np.zeros((frame_size, frame_size), np.uint8)
-            mask_frames.append(mimg)
+        # Pad with the last frame if the video was shorter than expected
+        if not frames:
+            frames = [np.zeros((224, 224, 3), dtype=np.uint8)]
+        while len(frames) < T:
+            frames.append(frames[-1].copy())
 
-        mask_t = torch.from_numpy(
-            np.stack(mask_frames).astype(np.float32)
-        ) / 255.0                                           # (T, H, W)
-        mask_grid = F.interpolate(
-            mask_t.unsqueeze(1), size=(grid_size, grid_size), mode="area"
-        ).squeeze(1).mean(0)                                # (grid_size, grid_size)
-
-        has_mask = mask_grid.sum() > 0
-        return mask_grid, bool(has_mask)
+        return frames
