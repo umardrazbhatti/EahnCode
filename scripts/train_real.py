@@ -12,7 +12,6 @@ import os
 import math
 import torch
 import numpy as np
-from tqdm import tqdm
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.amp import GradScaler, autocast
 
@@ -104,21 +103,22 @@ def main(config: EAHNConfig):
     ckpt_path = os.path.join(config.output_dir, "best_model.pth")
 
     # ── Training loop ─────────────────────────────────────────────────────────
+    import contextlib
+    total_batches = len(train_loader)
+    epoch_w = len(str(config.epochs))
+    batch_w = len(str(total_batches))
+
     for epoch in range(start_epoch, config.epochs):
         model.train()
         running_loss = 0.0
         optimizer.zero_grad()
 
-        pbar = tqdm(enumerate(train_loader), total=len(train_loader),
-                    desc=f"Epoch {epoch + 1}/{config.epochs}")
-
-        for batch_idx, batch in pbar:
+        for batch_idx, batch in enumerate(train_loader):
             frames   = batch["frames"].to(device)
             labels   = batch["label"].to(device)
             masks    = batch["mask"].to(device)
             has_mask = batch["has_mask"].to(device)
 
-            import contextlib
             ctx = autocast("cuda") if use_amp else contextlib.nullcontext()
 
             with ctx:
@@ -126,8 +126,8 @@ def main(config: EAHNConfig):
                 l_cls  = cls_loss_fn(out.logit, labels)
                 l_exp  = exp_loss_fn(out.M_t, masks, has_mask)
                 l_temp = temp_loss_fn(out.M_t, out.low_level)
-                loss   = l_cls + config.lambda1 * l_exp + config.lambda2 * l_temp
-                loss   = loss / config.grad_accum_steps
+                l_total = l_cls + config.lambda1 * l_exp + config.lambda2 * l_temp
+                loss    = l_total / config.grad_accum_steps
 
             if use_amp:
                 scaler.scale(loss).backward()
@@ -145,8 +145,15 @@ def main(config: EAHNConfig):
                     optimizer.step()
                 optimizer.zero_grad()
 
-            running_loss += loss.item() * config.grad_accum_steps
-            pbar.set_postfix({"loss": f"{loss.item() * config.grad_accum_steps:.4f}"})
+            running_loss += l_total.item()
+            print(
+                f"Epoch {epoch + 1:>{epoch_w}}/{config.epochs} | "
+                f"Batch {batch_idx + 1:>{batch_w}}/{total_batches} | "
+                f"Loss: {l_total.item():.4f} | "
+                f"Cls: {l_cls.item():.4f} | "
+                f"Exp: {l_exp.item():.4f} | "
+                f"Temp: {l_temp.item():.4f}"
+            )
 
         scheduler.step()
 
@@ -154,7 +161,7 @@ def main(config: EAHNConfig):
         model.eval()
         probs_list, labels_list = [], []
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validating", leave=False):
+            for batch in val_loader:
                 frames = batch["frames"].to(device)
                 out    = model(frames)
                 probs_list.extend(out.prob.cpu().tolist())
@@ -162,12 +169,10 @@ def main(config: EAHNConfig):
 
         metrics = DetectionMetrics.compute(probs_list, labels_list)
         logger.log_scalars("val", metrics, epoch)
-        avg_loss = running_loss / max(1, len(train_loader))
         print(
-            f"Epoch {epoch + 1}/{config.epochs} | "
-            f"Loss: {avg_loss:.4f} | "
-            f"Val AUC-ROC: {metrics['auc_roc']:.3f} | "
-            f"F1: {metrics['f1']:.3f}"
+            f"Epoch {epoch + 1:>{epoch_w}}/{config.epochs} | "
+            f"Val AUC-ROC: {metrics['auc_roc']:.4f} | "
+            f"F1: {metrics['f1']:.4f}"
         )
 
         # Save best
@@ -176,7 +181,7 @@ def main(config: EAHNConfig):
             best_auc = val_auc
             save_checkpoint(model, optimizer, scheduler, epoch, best_auc,
                             config, ckpt_path)
-            print(f"  --> Best model saved (AUC-ROC: {best_auc:.4f})")
+            print(f"--> Best model saved (AUC-ROC: {best_auc:.4f})")
 
         # Always save a per-epoch fallback checkpoint
         last_ckpt = os.path.join(config.output_dir, f"checkpoint_epoch{epoch:03d}.pth")
