@@ -113,6 +113,7 @@ class ExplanationMetrics:
             del_scores.append(del_score)
             ins_scores.append(ins_score)
 
-        del_auc = float(np.trapezoid(del_scores) / steps)
-        ins_auc = float(np.trapezoid(ins_scores) / steps)
+        _trapz = getattr(np, "trapezoid", np.trapz)
+        del_auc = float(_trapz(del_scores) / steps)
+        ins_auc = float(_trapz(ins_scores) / steps)
         return {"deletion_auc": del_auc, "insertion_auc": ins_auc}

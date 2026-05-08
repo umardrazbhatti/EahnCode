@@ -38,8 +38,8 @@ class FaceAligner:
         Returns list of (output_size×output_size×3) uint8 arrays.
         """
         if self.cache_dir:
-            cache_path = os.path.join(self.cache_dir,
-                                      f"{video_id.replace('/', '_')}.npy")
+            cache_key  = f"{video_id.replace('/', '_')}_T{len(frames)}"
+            cache_path = os.path.join(self.cache_dir, f"{cache_key}.npy")
             if os.path.exists(cache_path):
                 return list(np.load(cache_path, allow_pickle=False))
 

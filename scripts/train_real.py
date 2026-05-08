@@ -118,8 +118,6 @@ def main(config: EAHNConfig):
             masks    = batch["mask"].to(device)
             has_mask = batch["has_mask"].to(device)
 
-            ctx = autocast("cuda") if use_amp else torch.no_grad().__class__()
-            # NOTE: we can't use no_grad for training — use nullcontext instead
             import contextlib
             ctx = autocast("cuda") if use_amp else contextlib.nullcontext()
 

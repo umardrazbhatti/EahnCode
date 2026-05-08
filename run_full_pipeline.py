@@ -16,6 +16,7 @@ Usage (local synthetic smoke test):
 import os
 from config import EAHNConfig, parse_args
 from scripts.train_real import main as train_main
+from scripts.dashboard import show_dashboard
 
 
 def main():
@@ -26,6 +27,7 @@ def main():
     print(f"Device: {config.device}")
     print(f"Dataset: {config.dataset_name}")
     train_main(config)
+    show_dashboard(config.output_dir)
     print("Full pipeline completed. Outputs in", config.output_dir)
 
 

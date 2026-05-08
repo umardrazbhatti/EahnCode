@@ -272,10 +272,11 @@ class DeepfakeDataset(Dataset):
 
         max_fake = int(len(real) * max_fake_ratio)
         if len(fake) > max_fake:
+            n_before = len(fake)
             rng = random.Random(42)
             fake = rng.sample(fake, max_fake)
             print(
-                f"[DeepfakeDataset] Undersampled fakes from {len(fake) + (len(fake) - max_fake)} "
+                f"[DeepfakeDataset] Undersampled fakes from {n_before} "
                 f"to {max_fake} (ratio {max_fake_ratio}:1 vs {len(real)} reals)."
             )
 

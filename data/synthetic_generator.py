@@ -50,7 +50,13 @@ class SyntheticDataGenerator:
                     frame[y1:y2, x1:x2] = np.clip(patch, 0, 1)
                 frames.append(frame)
 
-        frames_np = np.stack(frames)                       # (T, H, W, 3)
-        frames_t = torch.from_numpy(frames_np).permute(0, 3, 1, 2)  # (T, 3, H, W)
-        mask_t = torch.from_numpy(mask)                    # (H, W)
+        frames_np = np.stack(frames)                                    # (T, H, W, 3)
+        frames_t  = torch.from_numpy(frames_np).permute(0, 3, 1, 2)  # (T, 3, H, W)
+
+        # ImageNet normalisation expected by pretrained EfficientNet/ConvNeXt backbones
+        mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32)
+        std  = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32)
+        frames_t = (frames_t - mean[None, :, None, None]) / std[None, :, None, None]
+
+        mask_t = torch.from_numpy(mask)                               # (H, W)
         return frames_t, label, mask_t
