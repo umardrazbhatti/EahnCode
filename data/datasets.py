@@ -9,9 +9,10 @@ Corrected path conventions for the actual Kaggle FF++ c23 layout:
 No pixel-level manipulation masks exist in this dataset snapshot,
 so has_masks=False and weakly-supervised L_exp is applied throughout.
 
-Class balance fix: 5 methods × 1000 fakes = 5000 fakes vs 1000 reals.
-Undersampling fakes to a max 2:1 ratio (2000 fakes : 1000 reals = 3000 total)
-before splitting, which ensures both classes appear in every split.
+Class balance: each class is capped at exactly 1000 samples (random.sample with
+a fixed seed=42) giving at most 2000 balanced samples before splitting.
+self.n_real and self.n_fake are set after the split so they reflect the count
+in that particular mode (train / val / test).
 """
 
 import os
@@ -108,12 +109,16 @@ class DeepfakeDataset(Dataset):
                 f"Check config.data_root='{config.data_root}'."
             )
 
-        # ── Log class distribution ──────────────────────────────────────
-        n_real = sum(1 for s in self.samples if s["label"] == 0)
-        n_fake = sum(1 for s in self.samples if s["label"] == 1)
+        # ── Store and log class distribution (post-split counts) ────────
+        self.n_real = sum(1 for s in self.samples if s["label"] == 0)
+        self.n_fake = sum(1 for s in self.samples if s["label"] == 1)
+        print(
+            f"[DeepfakeDataset] Balanced to {self.n_real} real + "
+            f"{self.n_fake} fake = {len(self.samples)} total"
+        )
         print(
             f"[DeepfakeDataset | {dataset_type} / {mode}] "
-            f"total={len(self.samples)}  real={n_real}  fake={n_fake}"
+            f"total={len(self.samples)}  real={self.n_real}  fake={self.n_fake}"
         )
 
     # ====================================================================
@@ -176,7 +181,7 @@ class DeepfakeDataset(Dataset):
         # ── Balance classes ──────────────────────────────────────────────
         # 5 methods × ~1000 fakes = ~5000 fakes vs ~1000 reals → 5:1 ratio.
         # Cap fakes at 2× the number of reals before splitting.
-        self._balance_classes(max_fake_ratio=2.0)
+        self._balance_classes()
 
     def _build_celeb_df(self):
         """
@@ -193,7 +198,7 @@ class DeepfakeDataset(Dataset):
         for p in self._glob_mp4(fake_dir):
             self.samples.append({"video_path": p, "label": 1, "mask_path": None})
         self.has_masks = False
-        self._balance_classes(max_fake_ratio=2.0)
+        self._balance_classes()
 
     def _build_dfdc(self):
         """
@@ -223,7 +228,7 @@ class DeepfakeDataset(Dataset):
                     {"video_path": vpath, "label": label, "mask_path": None}
                 )
         self.has_masks = False
-        self._balance_classes(max_fake_ratio=2.0)
+        self._balance_classes()
 
     def _build_synthetic(self):
         """
@@ -254,10 +259,11 @@ class DeepfakeDataset(Dataset):
             if f.lower().endswith(".mp4")
         )
 
-    def _balance_classes(self, max_fake_ratio: float = 2.0):
+    def _balance_classes(self):
         """
-        Undersample fakes so that len(fakes) / len(reals) <= max_fake_ratio.
-        Uses a fixed seed for reproducibility across runs.
+        Cap each class to exactly 1000 samples using a fixed seed for
+        reproducibility.  After balancing the dataset contains at most
+        2000 samples (1000 real + 1000 fake) before the train/val/test split.
         """
         real = [s for s in self.samples if s["label"] == 0]
         fake = [s for s in self.samples if s["label"] == 1]
@@ -270,15 +276,9 @@ class DeepfakeDataset(Dataset):
             )
             return
 
-        max_fake = int(len(real) * max_fake_ratio)
-        if len(fake) > max_fake:
-            n_before = len(fake)
-            rng = random.Random(42)
-            fake = rng.sample(fake, max_fake)
-            print(
-                f"[DeepfakeDataset] Undersampled fakes from {n_before} "
-                f"to {max_fake} (ratio {max_fake_ratio}:1 vs {len(real)} reals)."
-            )
+        rng  = random.Random(42)
+        real = rng.sample(real, min(len(real), 1000))
+        fake = rng.sample(fake, min(len(fake), 1000))
 
         combined = real + fake
         random.Random(42).shuffle(combined)

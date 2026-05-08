@@ -70,31 +70,50 @@ def show_dashboard(output_dir: str = "/kaggle/working/outputs"):
     heatmap_dir = os.path.join(output_dir, "heatmaps")
     if not os.path.isdir(heatmap_dir):
         print("No heatmap directory found.")
-        return
+    else:
+        _SUFFIXES = ["_intrinsic.mp4", "_gradcam.mp4", "_rollout.mp4", "_shap.mp4"]
+        sample_ids = set()
+        for fname in os.listdir(heatmap_dir):
+            for suffix in _SUFFIXES:
+                if fname.endswith(suffix):
+                    sample_ids.add(fname[: -len(suffix)])
+        sample_ids = sorted(sample_ids)
 
-    files  = sorted(os.listdir(heatmap_dir))
-    sample_ids = sorted(set(
-        f.split("_")[0] for f in files if f.endswith(".mp4")
-    ))
+        if not sample_ids:
+            print("No heatmap videos found.")
+        else:
+            if _IN_NOTEBOOK:
+                display(HTML("<h3>🔥 Heatmap Videos</h3>"))
 
-    if not sample_ids:
-        print("No heatmap videos found.")
-        return
+            for sid in sample_ids[:5]:
+                print(f"\nSample {sid}:")
+                for method in ["intrinsic", "gradcam", "rollout", "shap"]:
+                    fpath = os.path.join(heatmap_dir, f"{sid}_{method}.mp4")
+                    if os.path.exists(fpath):
+                        print(f"  [{method}] {fpath}")
+                        if _IN_NOTEBOOK:
+                            display(HTML(f"<b>{method}</b>"))
+                            display(IPVideo(fpath, embed=True, width=400))
+                    else:
+                        print(f"  [{method}] MISSING")
 
-    if _IN_NOTEBOOK:
-        display(HTML("<h3>🔥 Heatmap Videos</h3>"))
+    # ── Summary chart ─────────────────────────────────────────────────────────
+    chart_path = os.path.join(output_dir, "summary_chart.png")
+    if os.path.exists(chart_path):
+        print(f"\nSummary chart: {chart_path}")
+        if _IN_NOTEBOOK:
+            display(HTML(f'<img src="{chart_path}" width="900"/>'))
+    else:
+        print("\nSummary chart: NOT FOUND (run evaluate first)")
 
-    for sid in sample_ids[:5]:
-        print(f"\nSample {sid}:")
-        for method in ["intrinsic", "gradcam", "rollout", "shap"]:
-            fpath = os.path.join(heatmap_dir, f"{sid}_{method}.mp4")
-            if os.path.exists(fpath):
-                print(f"  [{method}] {fpath}")
-                if _IN_NOTEBOOK:
-                    display(HTML(f"<b>{method}</b>"))
-                    display(IPVideo(fpath, embed=True, width=400))
-            else:
-                print(f"  [{method}] MISSING")
+    # ── Explanation strips ────────────────────────────────────────────────────
+    explanation_dir = os.path.join(output_dir, "explanations")
+    if os.path.isdir(explanation_dir):
+        strip_files = [f for f in os.listdir(explanation_dir) if f.endswith("_strip.png")]
+        print(f"\nExplanations directory: {explanation_dir}")
+        print(f"  {len(strip_files)} annotated strip(s) found.")
+    else:
+        print("\nExplanations directory: NOT FOUND")
 
     print("\nDashboard complete.")
 

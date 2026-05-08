@@ -16,25 +16,50 @@ class ExplanationMetrics:
 
     @staticmethod
     def localisation_iou(
-        M_t_avg: torch.Tensor,   # (H, W) — time-averaged explanation map
-        gt_mask: torch.Tensor,   # (h, w) or (H, W)
+        M_t_avg: torch.Tensor,       # (B, H, W) or (H, W) — time-averaged maps
+        gt_masks: torch.Tensor,      # (B, h, w) or (h, w) — ground-truth masks
+        has_mask_flags,              # list[bool] or BoolTensor of length B
         threshold: float = 0.5,
-    ) -> float:
-        """Intersection-over-Union between binarised explanation and ground-truth mask."""
-        if gt_mask.sum() == 0:
-            return 0.0
-        # Resize gt_mask to match M_t_avg if necessary
-        if gt_mask.shape != M_t_avg.shape:
-            import torch.nn.functional as F
-            gt_mask = F.interpolate(
-                gt_mask.unsqueeze(0).unsqueeze(0).float(),
-                size=M_t_avg.shape, mode="bilinear", align_corners=False
-            ).squeeze()
-        M_bin = (M_t_avg > threshold).float()
-        gt    = gt_mask.float()
-        inter = (M_bin * gt).sum()
-        union = ((M_bin + gt) > 0).float().sum()
-        return float(inter / (union + 1e-8))
+    ):
+        """
+        Intersection-over-Union between binarised explanations and GT masks.
+
+        Only samples where has_mask_flags[i] is True are included.
+        Returns the mean IoU over valid samples, or None if no valid samples exist.
+        """
+        import torch.nn.functional as F
+
+        # Normalise to batch form
+        if M_t_avg.dim() == 2:
+            M_t_avg   = M_t_avg.unsqueeze(0)
+            gt_masks  = gt_masks.unsqueeze(0)
+            has_mask_flags = [has_mask_flags] \
+                if not hasattr(has_mask_flags, "__len__") else list(has_mask_flags)
+
+        B = M_t_avg.shape[0]
+        valid_ious = []
+
+        for i in range(B):
+            if not bool(has_mask_flags[i]):
+                continue
+            gt = gt_masks[i]
+            if gt.sum() == 0:
+                continue
+            m = M_t_avg[i]
+            if gt.shape != m.shape:
+                gt = F.interpolate(
+                    gt.unsqueeze(0).unsqueeze(0).float(),
+                    size=m.shape, mode="bilinear", align_corners=False,
+                ).squeeze()
+            M_bin = (m > threshold).float()
+            gt_f  = gt.float()
+            inter = (M_bin * gt_f).sum()
+            union = ((M_bin + gt_f) > 0).float().sum()
+            valid_ious.append(float(inter / (union + 1e-8)))
+
+        if len(valid_ious) == 0:
+            return None
+        return float(np.mean(valid_ious))
 
     @staticmethod
     def temporal_ssim(M_t_up: torch.Tensor) -> float:

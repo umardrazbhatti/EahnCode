@@ -31,7 +31,12 @@ from data.collate import deepfake_collate_fn
 from metrics.detection import DetectionMetrics
 from metrics.explanation import ExplanationMetrics
 from utils.checkpointing import load_checkpoint
-from utils.visualization import save_explanation_video, generate_text_explanation
+from utils.visualization import (
+    save_annotated_frame_strip,
+    save_explanation_video,
+    overlay_heatmap_on_frame,
+    get_region_label,
+)
 import cv2
 
 
@@ -144,6 +149,7 @@ def run_evaluation(config: EAHNConfig):
     # ── Detection pass ────────────────────────────────────────────────────────
     all_probs, all_labels = [], []
     all_M_t_up, all_masks = [], []
+    all_has_mask_flags    = []
 
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Evaluating detection"):
@@ -153,12 +159,22 @@ def run_evaluation(config: EAHNConfig):
             all_labels.extend(batch["label"].cpu().tolist())
             all_M_t_up.append(out.M_t_up.cpu())
             all_masks.append(batch["mask"].cpu())
+            all_has_mask_flags.extend(batch["has_mask"].cpu().tolist())
 
     all_M_t_up = torch.cat(all_M_t_up, dim=0)   # (N_test, T, H, W)
     all_masks  = torch.cat(all_masks,  dim=0)   # (N_test, 7, 7)
 
     det_metrics = DetectionMetrics.compute(all_probs, all_labels)
     print("Detection Metrics:", det_metrics)
+
+    # ── Confusion matrix (5a) ─────────────────────────────────────────────────
+    from sklearn.metrics import confusion_matrix as sk_confusion_matrix
+    try:
+        preds_arr = (np.array(all_probs) >= 0.5).astype(int)
+        cm        = sk_confusion_matrix(np.array(all_labels, dtype=int), preds_arr)
+        tn, fp, fn, tp = cm.ravel()
+    except Exception:
+        tn = fp = fn = tp = 0
 
     # ── Save detection graphs (requires both classes) ─────────────────────────
     labels_arr = np.array(all_labels)
@@ -167,21 +183,38 @@ def run_evaluation(config: EAHNConfig):
     else:
         print("[Evaluate] Skipping detection graphs — only one class in test set.")
 
+    # ── Split counts + summary chart (5b, 5c, 5d) ────────────────────────────
+    train_ds_tmp = DeepfakeDataset(config, "train", config.dataset_name)
+    val_ds_tmp   = DeepfakeDataset(config, "val",   config.dataset_name)
+    split_counts = {
+        "total":      len(train_ds_tmp) + len(val_ds_tmp) + len(test_ds),
+        "train":      len(train_ds_tmp),
+        "train_real": train_ds_tmp.n_real,
+        "train_fake": train_ds_tmp.n_fake,
+        "val":        len(val_ds_tmp),
+        "test":       len(test_ds),
+        "test_real":  test_ds.n_real,
+        "test_fake":  test_ds.n_fake,
+    }
+    metrics_dict_full = {
+        **det_metrics,
+        "tp": int(tp), "fp": int(fp), "tn": int(tn), "fn": int(fn),
+    }
+    from scripts.summary_chart import plot_summary_chart
+    plot_summary_chart(metrics_dict_full, split_counts, config.output_dir)
+
     # ── Explanation metrics on a subset ──────────────────────────────────────
     subset_size = min(config.heatmap_samples, len(test_ds))
     rng     = np.random.default_rng(42)
     indices = rng.choice(len(test_ds), subset_size, replace=False)
 
-    # Localisation IoU
-    iou_list = []
-    for idx in tqdm(indices, desc="Computing IoU", leave=False):
-        mask = all_masks[idx]                      # (7, 7)
-        if mask.sum() > 0:
-            iou = ExplanationMetrics.localisation_iou(
-                all_M_t_up[idx].mean(0), mask, threshold=0.5
-            )
-            iou_list.append(iou)
-    avg_iou = float(np.mean(iou_list)) if iou_list else 0.0
+    # Localisation IoU — only for samples that have ground-truth masks (5e)
+    M_sub_avg = all_M_t_up[indices].mean(dim=1)             # (subset, H, W)
+    masks_sub = all_masks[indices]                          # (subset, h, w)
+    hm_flags  = [all_has_mask_flags[int(i)] for i in indices]
+    avg_iou   = ExplanationMetrics.localisation_iou(
+        M_sub_avg, masks_sub, hm_flags, threshold=0.5
+    )   # float or None
 
     # Temporal SSIM
     ssim_val = ExplanationMetrics.temporal_ssim(all_M_t_up[indices])
@@ -230,8 +263,9 @@ def run_evaluation(config: EAHNConfig):
     except Exception as e:
         print(f"  [Deletion/Insertion AUC skipped: {e}]")
 
+    avg_iou_display = avg_iou if avg_iou is not None else "N/A (no masks)"
     exp_metrics = {
-        "avg_iou":           avg_iou,
+        "avg_iou":           avg_iou_display,
         "temporal_ssim":     ssim_val,
         "faithfulness_corr": faithful_corr,
         **del_ins,
@@ -293,49 +327,48 @@ def _generate_heatmaps(config, model, test_ds, sample_indices, device, all_probs
 
         with torch.no_grad():
             out = model(frames_tensor)
-        intrinsic = out.M_t_up[0].cpu().numpy()   # (T, H, W)
+        intrinsic = out.M_t_up[0].cpu().numpy()     # (T, H, W)
         prob      = float(out.prob[0].cpu())
+        verdict   = "FAKE" if prob > 0.5 else "REAL"
 
-        # ── Plain-English text explanation ────────────────────────────────────
-        M_t_list = [intrinsic[t] for t in range(intrinsic.shape[0])]
-        text = generate_text_explanation(
-            prob=prob, M_t_seq=M_t_list, video_path=video_path
+        # Convert intrinsic to list form for new viz API
+        intrinsic_maps   = [intrinsic[t] for t in range(intrinsic.shape[0])]
+        intrinsic_scores = [float(m.max()) for m in intrinsic_maps]
+
+        # ── Annotated frame strip + companion text explanation (5f) ───────────
+        save_annotated_frame_strip(
+            sampled_orig, intrinsic_maps, intrinsic_scores, verdict, prob,
+            os.path.join(explanation_dir, f"{video_id}_strip.png"),
+            sample_id=video_id,
         )
-        txt_path = os.path.join(explanation_dir, f"{video_id}_explanation.txt")
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write(text)
 
-        # Post-hoc heatmaps
-        try:
-            gc_heat = gradcam_exp.explain(frames_tensor)[0]   # (T,H,W)
-        except Exception as e:
-            print(f"  [GradCAM failed for idx {idx}: {e}]")
-            gc_heat = intrinsic
+        # ── Intrinsic explanation video (5f) ──────────────────────────────────
+        save_explanation_video(
+            sampled_orig, intrinsic_maps, intrinsic_scores, verdict, prob,
+            os.path.join(heatmap_dir, f"{video_id}_intrinsic.mp4"),
+        )
 
-        try:
-            roll_heat = rollout_exp.explain(frames_tensor)    # (T,H,W)
-        except Exception as e:
-            print(f"  [Rollout failed for idx {idx}: {e}]")
-            roll_heat = intrinsic
+        # ── Post-hoc heatmaps ─────────────────────────────────────────────────
+        for method_name, explainer in [
+            ("gradcam", gradcam_exp),
+            ("rollout", rollout_exp),
+            ("shap",    shap_exp),
+        ]:
+            try:
+                if method_name == "gradcam":
+                    heat = explainer.explain(frames_tensor)[0]   # (T,H,W) numpy
+                else:
+                    heat = explainer.explain(frames_tensor)      # (T,H,W) numpy
+            except Exception as e:
+                print(f"  [{method_name} failed for idx {idx}: {e}]")
+                heat = intrinsic
 
-        try:
-            sh_heat = shap_exp.explain(frames_tensor)         # (T,H,W)
-        except Exception as e:
-            print(f"  [SHAP failed for idx {idx}: {e}]")
-            sh_heat = intrinsic
-
-        save_explanation_video(sampled_orig, intrinsic,
-                               os.path.join(heatmap_dir, f"{video_id}_intrinsic.mp4"),
-                               prob=prob)
-        save_explanation_video(sampled_orig, gc_heat,
-                               os.path.join(heatmap_dir, f"{video_id}_gradcam.mp4"),
-                               prob=prob)
-        save_explanation_video(sampled_orig, roll_heat,
-                               os.path.join(heatmap_dir, f"{video_id}_rollout.mp4"),
-                               prob=prob)
-        save_explanation_video(sampled_orig, sh_heat,
-                               os.path.join(heatmap_dir, f"{video_id}_shap.mp4"),
-                               prob=prob)
+            maps_list   = [heat[t] for t in range(heat.shape[0])]
+            scores_list = [float(m.max()) for m in maps_list]
+            save_explanation_video(
+                sampled_orig, maps_list, scores_list, verdict, prob,
+                os.path.join(heatmap_dir, f"{video_id}_{method_name}.mp4"),
+            )
 
 
 def _get_original_frames(video_path: str, num_frames: int, frame_size: int):
