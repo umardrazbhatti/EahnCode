@@ -219,3 +219,7 @@ class AutomatedStimulusGenerator:
                 "  3. Administer via a web interface (e.g., jsPsych or PsychoPy online).\n"
                 "  4. Collect participant judgements (real/fake) and response times.\n"
             )
+
+
+# Alias for backward compatibility with evaluate.py import
+generate_stimuli = AutomatedStimulusGenerator

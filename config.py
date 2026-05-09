@@ -41,7 +41,7 @@ class EAHNConfig:
     beta: float = 0.5      # TV weight in weak supervision
     gamma: float = 0.1     # gate decay rate in L_temp (was 10.0 — caused exp→0)
     attn_temp_init: float = 1.386   # log(4.0) — learnable cross-attention temperature init
-    attn_diversity_weight: float = 0.5  # weight for attention diversity penalty in L_exp
+    attn_diversity_weight: float = 2.5  # weight for attention diversity penalty in L_exp
 
     # ── Training ──────────────────────────────────────────────────────────────
     epochs: int = 50

@@ -126,7 +126,9 @@ def main(config: EAHNConfig):
                 l_cls  = cls_loss_fn(out.logit, labels)
                 l_exp  = exp_loss_fn(out.M_t, masks, has_mask)
                 l_temp = temp_loss_fn(out.M_t, out.low_level)
-                l_total = l_cls + config.lambda1 * l_exp + config.lambda2 * l_temp
+                _global_step = epoch * len(train_loader) + batch_idx
+                _lambda1_eff = config.lambda1 * min(1.0, _global_step / 200.0)
+                l_total = l_cls + _lambda1_eff * l_exp + config.lambda2 * l_temp
                 loss    = l_total / config.grad_accum_steps
 
             if use_amp:
@@ -149,6 +151,18 @@ def main(config: EAHNConfig):
                 print(f"[DIAG] M_t mean={out.M_t.mean():.4f} std={out.M_t.std():.4f}")
                 print(f"[DIAG] L_cls={l_cls.item():.4f} L_exp={l_exp.item():.4f} L_temp={l_temp.item():.4f}")
                 print(f"[DIAG] attn_temp=exp({model.cross_attention.log_temp.item():.3f})={torch.exp(model.cross_attention.log_temp).item():.3f}")
+
+            if batch_idx % 20 == 0:
+                _live_std = out.M_t.std().item()
+                _live_tau = model.cross_attention.log_temp.exp().item()
+                print(
+                    f"[LIVE E{epoch+1} B{batch_idx:03d}] "
+                    f"M_t_std={_live_std:.4f}  "
+                    f"tau={_live_tau:.3f}  "
+                    f"L_exp={l_exp.item():.4f}  "
+                    f"L_temp={l_temp.item():.6f}  "
+                    f"λ1_eff={_lambda1_eff:.4f}"
+                )
 
             running_loss += l_total.item()
             print(

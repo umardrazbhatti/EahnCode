@@ -48,7 +48,7 @@ class CrossAttentionFusion(nn.Module):
         Vp = self.v_proj(S_flat)
 
         # Temperature-scaled attention
-        tau    = torch.exp(self.log_temp).clamp(min=1.0, max=16.0)
+        tau    = torch.exp(self.log_temp).clamp(min=2.0, max=20.0)
         scores = torch.bmm(Qp, Kp.transpose(-2, -1)) / (self.scale * tau)  # (B·T, L, L)
         A      = F.softmax(scores, dim=-1)  # softmax over key dimension
 
