@@ -29,6 +29,7 @@ class EAHNOutput:
     M_t_up:    torch.Tensor   # (B, T, H, W)
     S:         torch.Tensor   # (B, T, N, d_model)
     low_level: torch.Tensor   # (B, T, C_low, Hl, Wl)
+    attn_pool: torch.Tensor   # (B, d_model) — attention-weighted pooling for grad path
 
 
 class EAHN(nn.Module):
@@ -66,7 +67,7 @@ class EAHN(nn.Module):
         )
 
         # ── Cross-Attention Fusion ────────────────────────────────────────────
-        self.cross_attn = CrossAttentionFusion(d_model=d)
+        self.cross_attention = CrossAttentionFusion(d_model=d, num_heads=config.transformer_heads)
 
         # ── Classification Head ───────────────────────────────────────────────
         self.classifier = nn.Linear(d, 1)
@@ -107,8 +108,8 @@ class EAHN(nn.Module):
 
         Q = Q.reshape(B, T, N, d)
 
-        # Cross-attention fusion → intrinsic explanation maps
-        M_t, _ = self.cross_attn(Q, spatial_tokens)         # (B, T, h, w)
+        # Cross-attention fusion → explanation maps + attention-pooled features
+        M_t, attn_pool = self.cross_attention(Q, spatial_tokens)  # (B, T, h, w), (B, d)
 
         # Upsample explanation maps to input resolution for visualisation / loss
         M_t_up = F.interpolate(
@@ -118,12 +119,14 @@ class EAHN(nn.Module):
             align_corners=False,
         ).reshape(B, T, H, W)                               # (B, T, H, W)
 
-        # Classification via CLS token
-        logit = self.classifier(cls_out).squeeze(-1)         # (B,)
+        # CRITICAL: residual fusion creates the gradient path L_cls → attn_pool → M_t
+        final_feat = cls_out + attn_pool                    # (B, d)
+        logit = self.classifier(final_feat).squeeze(-1)     # (B,)
         prob  = torch.sigmoid(logit)
 
         return EAHNOutput(
             logit=logit, prob=prob,
             M_t=M_t, M_t_up=M_t_up,
             S=spatial_tokens, low_level=low_level,
+            attn_pool=attn_pool,
         )

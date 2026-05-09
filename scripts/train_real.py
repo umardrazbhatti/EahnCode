@@ -145,6 +145,11 @@ def main(config: EAHNConfig):
                     optimizer.step()
                 optimizer.zero_grad()
 
+            if epoch == 0 and batch_idx == 0:
+                print(f"[DIAG] M_t mean={out.M_t.mean():.4f} std={out.M_t.std():.4f}")
+                print(f"[DIAG] L_cls={l_cls.item():.4f} L_exp={l_exp.item():.4f} L_temp={l_temp.item():.4f}")
+                print(f"[DIAG] attn_temp=exp({model.cross_attention.log_temp.item():.3f})={torch.exp(model.cross_attention.log_temp).item():.3f}")
+
             running_loss += l_total.item()
             print(
                 f"Epoch {epoch + 1:>{epoch_w}}/{config.epochs} | "

@@ -73,6 +73,29 @@ def overlay_heatmap_on_frame(
     return overlay, attn_norm
 
 
+# ── overlay_explanation ───────────────────────────────────────────────────────
+
+def overlay_explanation(
+    frame_bgr: np.ndarray,
+    attention_map: np.ndarray,
+    alpha: float = 0.4,
+    colormap: int = cv2.COLORMAP_JET,
+) -> np.ndarray:
+    """
+    Thin wrapper around overlay_heatmap_on_frame for user-study stimulus generation.
+
+    Args:
+        frame_bgr:     H×W×3 BGR numpy array
+        attention_map: H×W float32 in [0, 1]
+        alpha:         blend weight for heatmap overlay
+        colormap:      OpenCV colormap constant
+    Returns:
+        overlay_bgr:   H×W×3 BGR numpy array with heatmap blended in
+    """
+    overlay_bgr, _ = overlay_heatmap_on_frame(frame_bgr, attention_map, alpha, colormap)
+    return overlay_bgr
+
+
 # ── get_region_label ──────────────────────────────────────────────────────────
 
 def get_region_label(attn_map: np.ndarray) -> str:
@@ -126,10 +149,15 @@ def generate_explanation_text(
     -------
     str
     """
-    T = len(attention_scores)
+    from collections import Counter
+
+    T           = len(attention_scores)
+    max_score   = max(attention_scores) if T > 0 else 0.0
+    min_score   = min(attention_scores) if T > 0 else 0.0
+    score_range = max_score - min_score
+
     sorted_frames = sorted(range(T), key=lambda i: attention_scores[i], reverse=True)
     top3 = sorted_frames[:3]
-    score_range = max(attention_scores) - min(attention_scores) if T > 0 else 0.0
 
     lines = [
         f"VERDICT: This video is likely {verdict} (confidence: {confidence:.0%}).",
@@ -137,17 +165,18 @@ def generate_explanation_text(
         "EXPLANATION:",
     ]
 
-    if score_range < 0.02:
-        lines.append("  • Attention was distributed uniformly across all frames.")
+    if score_range < 0.01:
         lines.append(
-            "    (Model may need more training to develop frame-specific focus.)"
+            "  • Attention was distributed uniformly across frames. "
+            "Consider checking the explanation head."
         )
     else:
         top3_labels = ", ".join(str(f + 1) for f in top3)
         lines.append(f"  • Attention was highest in frames {top3_labels}.")
 
-    best_frame = top3[0] if top3 else 0
-    region = get_region_label(attention_maps[best_frame])
+    # Compute region label per frame; report the most common one
+    per_frame_regions = [get_region_label(attention_maps[t]) for t in range(T)]
+    region = Counter(per_frame_regions).most_common(1)[0][0]
     lines.append(f"  • The primary area of concern is the {region}.")
 
     if verdict == "FAKE":

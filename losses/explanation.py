@@ -10,10 +10,12 @@ import torch.nn.functional as F
 
 
 class ExplanationLoss(nn.Module):
-    def __init__(self, alpha: float = 0.5, beta: float = 0.5):
+    def __init__(self, alpha: float = 0.5, beta: float = 0.5,
+                 diversity_weight: float = 0.5):
         super().__init__()
-        self.alpha = alpha
-        self.beta  = beta
+        self.alpha           = alpha
+        self.beta            = beta
+        self.diversity_weight = diversity_weight
 
     def forward(
         self,
@@ -48,6 +50,12 @@ class ExplanationLoss(nn.Module):
                 tv_w = (M_t[i, :, 1:, :] - M_t[i, :, :-1, :]).abs().mean()
                 tv   = tv_h + tv_w
 
-                loss = loss + self.alpha * entropy + self.beta * tv
+                # Diversity penalty: push std(M_t) above 0.3 per frame
+                # relu(0.3 - std) is > 0 only when map is too uniform (std < 0.3)
+                spatial_std   = M_t[i].std(dim=(-1, -2))          # (T,)
+                diversity_loss = F.relu(0.3 - spatial_std).mean()
+
+                loss = loss + (self.alpha * entropy + self.beta * tv
+                               + self.diversity_weight * diversity_loss)
 
         return loss / B

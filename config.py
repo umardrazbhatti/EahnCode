@@ -39,7 +39,9 @@ class EAHNConfig:
     lambda2: float = 0.5   # L_temp weight
     alpha: float = 0.5     # entropy weight in weak supervision
     beta: float = 0.5      # TV weight in weak supervision
-    gamma: float = 10.0    # gate decay rate in L_temp
+    gamma: float = 0.1     # gate decay rate in L_temp (was 10.0 — caused exp→0)
+    attn_temp_init: float = 1.386   # log(4.0) — learnable cross-attention temperature init
+    attn_diversity_weight: float = 0.5  # weight for attention diversity penalty in L_exp
 
     # ── Training ──────────────────────────────────────────────────────────────
     epochs: int = 50
@@ -108,4 +110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_after_train", action="store_true", default=None)
     parser.add_argument("--resume_checkpoint", type=str, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--gamma", type=float, default=None)
+    parser.add_argument("--attn_temp_init", type=float, default=None)
+    parser.add_argument("--attn_diversity_weight", type=float, default=None)
     return parser.parse_args()
