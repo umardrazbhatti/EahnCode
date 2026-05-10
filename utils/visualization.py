@@ -98,31 +98,61 @@ def overlay_explanation(
 
 # ── get_region_label ──────────────────────────────────────────────────────────
 
+_REGION_LABELS = {
+    ("upper",  "left"):   "upper-left periocular region",
+    ("upper",  "center"): "upper-central forehead and brow region",
+    ("upper",  "right"):  "upper-right periocular region",
+    ("middle", "left"):   "left cheek and ear region",
+    ("middle", "center"): "central nasal and mid-face region",
+    ("middle", "right"):  "right cheek and ear region",
+    ("lower",  "left"):   "lower-left jaw and mouth region",
+    ("lower",  "center"): "lower-central mouth and chin region",
+    ("lower",  "right"):  "lower-right jaw and mouth region",
+}
+
+
 def get_region_label(attn_map: np.ndarray) -> str:
     """
-    Return a human-readable label for the centroid of the high-attention region.
+    Return a human-readable 9-region label for the peak of the attention map.
+
+    Partitions the map into a 3×3 grid:
+      rows 0-1=upper, 2-4=middle, 5-6=lower
+      cols 0-1=left,  2-4=center, 5-6=right
+
+    Appends "(peak at row=r, col=c)" for verifiability.
 
     Parameters
     ----------
-    attn_map : 2D numpy float array
+    attn_map : 2D numpy float array (any spatial size, but designed for 7×7)
 
     Returns
     -------
-    str  e.g. "upper-left facial region"
+    str  e.g. "central nasal and mid-face region (peak at row=3, col=3)"
     """
-    binary = attn_map >= 0.5
-    if not binary.any():
-        return "full face"
+    peak_idx = int(np.argmax(attn_map))
+    r, c = np.unravel_index(peak_idx, attn_map.shape)
+    H, W = attn_map.shape
 
-    ys, xs = np.where(binary)
-    H, W   = attn_map.shape
-    cy     = ys.mean() / H   # 0–1 fraction (row)
-    cx     = xs.mean() / W   # 0–1 fraction (col)
+    # Row bucket: upper=rows 0-1, middle=rows 2-4, lower=rows 5-6 (for 7-row map)
+    row_frac = r / max(H - 1, 1)
+    if row_frac < 2 / 6:
+        row_key = "upper"
+    elif row_frac <= 4 / 6:
+        row_key = "middle"
+    else:
+        row_key = "lower"
 
-    vertical   = "upper" if cy < 0.4 else ("lower" if cy > 0.6 else "mid")
-    horizontal = "left"  if cx < 0.4 else ("right" if cx > 0.6 else "central")
+    # Col bucket: left=cols 0-1, center=cols 2-4, right=cols 5-6 (for 7-col map)
+    col_frac = c / max(W - 1, 1)
+    if col_frac < 2 / 6:
+        col_key = "left"
+    elif col_frac <= 4 / 6:
+        col_key = "center"
+    else:
+        col_key = "right"
 
-    return f"{vertical}-{horizontal} facial region"
+    label = _REGION_LABELS.get((row_key, col_key), "central nasal and mid-face region")
+    return f"{label} (peak at row={r}, col={c})"
 
 
 # ── generate_explanation_text ─────────────────────────────────────────────────
@@ -149,8 +179,6 @@ def generate_explanation_text(
     -------
     str
     """
-    from collections import Counter
-
     T           = len(attention_scores)
     max_score   = max(attention_scores) if T > 0 else 0.0
     min_score   = min(attention_scores) if T > 0 else 0.0
@@ -165,7 +193,7 @@ def generate_explanation_text(
         "EXPLANATION:",
     ]
 
-    if score_range < 0.005:
+    if score_range < 0.05:
         lines.append(
             "  • Attention was distributed uniformly across frames. "
             "Consider checking the explanation head."
@@ -174,9 +202,9 @@ def generate_explanation_text(
         top3_labels = ", ".join(str(f + 1) for f in top3)
         lines.append(f"  • Attention was highest in frames {top3_labels}.")
 
-    # Compute region label per frame; report the most common one
-    per_frame_regions = [get_region_label(attention_maps[t]) for t in range(T)]
-    region = Counter(per_frame_regions).most_common(1)[0][0]
+    # Region label from peak of mean attention map across all frames
+    mean_attn = np.mean(np.stack(attention_maps), axis=0)
+    region    = get_region_label(mean_attn)
     lines.append(f"  • The primary area of concern is the {region}.")
 
     if verdict == "FAKE":
@@ -250,7 +278,7 @@ def save_annotated_frame_strip(
     strip_w = strip.shape[1]
 
     # Build explanation text and render onto a dark PIL panel
-    confidence = abs(prob - 0.5) * 2
+    confidence = prob if prob >= 0.5 else (1.0 - prob)
     text       = generate_explanation_text(
         verdict, confidence, prob, attention_scores, attention_maps
     )
@@ -319,7 +347,7 @@ def save_explanation_video(
     fps              : frames per second
     """
     T          = len(frames_bgr)
-    confidence = abs(prob - 0.5) * 2
+    confidence = prob if prob >= 0.5 else (1.0 - prob)
     verdict_color_bgr = (80, 80, 255) if verdict == "FAKE" else (80, 255, 80)
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)

@@ -336,8 +336,15 @@ def _generate_heatmaps(config, model, test_ds, sample_indices, device, all_probs
         verdict   = "FAKE" if prob > 0.5 else "REAL"
 
         # Convert intrinsic to list form for new viz API
-        intrinsic_maps   = [intrinsic[t] for t in range(intrinsic.shape[0])]
-        intrinsic_scores = [float(m.max() - m.min()) for m in intrinsic_maps]
+        intrinsic_maps = [intrinsic[t] for t in range(intrinsic.shape[0])]
+
+        def _peakiness(m: np.ndarray) -> float:
+            flat = m.flatten().astype(np.float64) + 1e-12
+            flat = flat / flat.sum()
+            H_val = -(flat * np.log(flat)).sum()
+            return float(1.0 - H_val / np.log(flat.size))
+
+        intrinsic_scores = [_peakiness(m) for m in intrinsic_maps]
 
         # ── Annotated frame strip + companion text explanation (5f) ───────────
         save_annotated_frame_strip(
