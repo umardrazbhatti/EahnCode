@@ -2,7 +2,7 @@
 models/cross_attention.py — Cross-Attention Fusion with learnable temperature.
 
 Returns (M_t, attn_pool):
-  M_t      : (B, T, h, w)  intrinsic explanation maps, max-normalised to [0,1]
+  M_t      : (B, T, h, w)  intrinsic explanation maps (softmax probability distributions)
   attn_pool : (B, d_model)  attention-weighted spatial pooling for classifier gradient path
 
 The attn_pool → classifier residual path ensures that L_cls gradients flow back
@@ -48,7 +48,7 @@ class CrossAttentionFusion(nn.Module):
         Vp = self.v_proj(S_flat)
 
         # Temperature-scaled attention
-        tau    = torch.exp(self.log_temp).clamp(min=2.0, max=20.0)
+        tau    = torch.exp(self.log_temp).clamp(min=0.5, max=10.0)
         scores = torch.bmm(Qp, Kp.transpose(-2, -1)) / (self.scale * tau)  # (B·T, L, L)
         A      = F.softmax(scores, dim=-1)  # softmax over key dimension
 
@@ -58,11 +58,6 @@ class CrossAttentionFusion(nn.Module):
         # Explanation map: mean over query positions → each key location's total weight
         M_flat = A.mean(dim=-2)          # (B·T, L)
         M_t    = M_flat.reshape(B, T, h, w)
-
-        # Max-norm per frame — preserves absolute importance; gradient still flows
-        # when map is flat (unlike min-max which collapses flat maps to a constant)
-        M_max = M_t.amax(dim=(-1, -2), keepdim=True).clamp(min=1e-8)
-        M_t   = M_t / M_max
 
         # Attention-weighted spatial pooling for classifier gradient path.
         # CRITICAL: grad(L_cls) → attn_pool → M_flat → A → Q, K projections → M_t

@@ -165,7 +165,7 @@ def generate_explanation_text(
         "EXPLANATION:",
     ]
 
-    if score_range < 0.01:
+    if score_range < 0.005:
         lines.append(
             "  • Attention was distributed uniformly across frames. "
             "Consider checking the explanation head."

@@ -288,8 +288,12 @@ def run_evaluation(config: EAHNConfig):
 
     # ── User-study stimuli ────────────────────────────────────────────────────
     try:
-        from user_study.generate_stimuli import generate_stimuli
-        generate_stimuli(config, model)
+        from user_study.generate_stimuli import AutomatedStimulusGenerator
+        from xai.gradcam import GradCAMExplainer
+        _gradcam = GradCAMExplainer(model, target_layer=model.spatial_stream.grad_cam_target_layer)
+        _stim_dir = os.path.join(config.output_dir, "user_study")
+        _generator = AutomatedStimulusGenerator(model, test_loader, _gradcam, config, _stim_dir)
+        _generator.generate()
     except Exception as e:
         print(f"  [User-study stimuli skipped: {e}]")
 
@@ -333,7 +337,7 @@ def _generate_heatmaps(config, model, test_ds, sample_indices, device, all_probs
 
         # Convert intrinsic to list form for new viz API
         intrinsic_maps   = [intrinsic[t] for t in range(intrinsic.shape[0])]
-        intrinsic_scores = [float(m.max()) for m in intrinsic_maps]
+        intrinsic_scores = [float(m.max() - m.min()) for m in intrinsic_maps]
 
         # ── Annotated frame strip + companion text explanation (5f) ───────────
         save_annotated_frame_strip(

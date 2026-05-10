@@ -97,7 +97,7 @@ def main(config: EAHNConfig):
 
     # ── Losses ────────────────────────────────────────────────────────────────
     cls_loss_fn  = ClassificationLoss()
-    exp_loss_fn  = ExplanationLoss(alpha=config.alpha, beta=config.beta)
+    exp_loss_fn  = ExplanationLoss(alpha=config.alpha, beta=config.beta, diversity_weight=config.attn_diversity_weight)
     temp_loss_fn = TemporalConsistencyLoss(gamma=config.gamma)
 
     ckpt_path = os.path.join(config.output_dir, "best_model.pth")
