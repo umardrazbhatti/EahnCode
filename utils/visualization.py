@@ -73,28 +73,6 @@ def overlay_heatmap_on_frame(
     return overlay, attn_norm
 
 
-# ── overlay_explanation ───────────────────────────────────────────────────────
-
-def overlay_explanation(
-    frame_bgr: np.ndarray,
-    attention_map: np.ndarray,
-    alpha: float = 0.4,
-    colormap: int = cv2.COLORMAP_JET,
-) -> np.ndarray:
-    """
-    Thin wrapper around overlay_heatmap_on_frame for user-study stimulus generation.
-
-    Args:
-        frame_bgr:     H×W×3 BGR numpy array
-        attention_map: H×W float32 in [0, 1]
-        alpha:         blend weight for heatmap overlay
-        colormap:      OpenCV colormap constant
-    Returns:
-        overlay_bgr:   H×W×3 BGR numpy array with heatmap blended in
-    """
-    overlay_bgr, _ = overlay_heatmap_on_frame(frame_bgr, attention_map, alpha, colormap)
-    return overlay_bgr
-
 
 # ── get_region_label ──────────────────────────────────────────────────────────
 
@@ -163,29 +141,46 @@ def generate_explanation_text(
     prob: float,
     attention_scores: list,
     attention_maps: list,
+    batch_inter_sample_sim: float = 0.0,
 ) -> str:
     """
     Build a multi-line plain-English explanation string.
 
     Parameters
     ----------
-    verdict          : "FAKE" or "REAL"
-    confidence       : float 0–1  (abs(prob - 0.5) * 2)
-    prob             : float  raw sigmoid output
-    attention_scores : list of T floats — per-frame scalar attention values
-    attention_maps   : list of T 2-D numpy arrays
+    verdict                 : "FAKE" or "REAL"
+    confidence              : float 0–1  (abs(prob - 0.5) * 2)
+    prob                    : float  raw sigmoid output
+    attention_scores        : list of T floats — per-frame scalar attention values
+    attention_maps          : list of T 2-D numpy arrays
+    batch_inter_sample_sim  : mean cosine sim across the evaluation batch (for collapse check)
 
     Returns
     -------
     str
     """
-    T           = len(attention_scores)
-    max_score   = max(attention_scores) if T > 0 else 0.0
-    min_score   = min(attention_scores) if T > 0 else 0.0
-    score_range = max_score - min_score
+    T = len(attention_scores)
+    M_t_up = np.stack(attention_maps) if T > 0 else np.zeros((1, 7, 7))
+
+    # --- Collapse diagnostics (computed before text generation) ---
+
+    # 1. Spatially uniform within frames? → mean per-frame std < 0.01
+    spatial_std_per_frame = [float(m.std()) for m in M_t_up]
+    is_spatially_uniform  = float(np.mean(spatial_std_per_frame)) < 0.01
+
+    # 2. Temporally frozen? → cosine sim between t=0 and t=T-1 > 0.99
+    if T > 1:
+        flat0     = M_t_up[0].flatten() / (np.linalg.norm(M_t_up[0]) + 1e-8)
+        flat_last = M_t_up[-1].flatten() / (np.linalg.norm(M_t_up[-1]) + 1e-8)
+        is_temporally_frozen = float(np.dot(flat0, flat_last)) > 0.99
+    else:
+        is_temporally_frozen = False
+
+    # 3. Class-agnostic? → batch-mean inter-sample cosine sim > 0.95
+    is_class_agnostic = batch_inter_sample_sim > 0.95
 
     sorted_frames = sorted(range(T), key=lambda i: attention_scores[i], reverse=True)
-    top3 = sorted_frames[:3]
+    top3          = sorted_frames[:3]
 
     lines = [
         f"VERDICT: This video is likely {verdict} (confidence: {confidence:.0%}).",
@@ -193,17 +188,33 @@ def generate_explanation_text(
         "EXPLANATION:",
     ]
 
-    if score_range < 0.05:
+    # Choose message based on collapse diagnostics
+    if is_spatially_uniform and is_temporally_frozen and is_class_agnostic:
         lines.append(
-            "  • Attention was distributed uniformly across frames. "
-            "Consider checking the explanation head."
+            "  ⚠ EXPLANATION COLLAPSE DETECTED — heatmap is identical across frames "
+            "AND across samples. Re-train with stronger inter-sample diversity loss."
+        )
+    elif is_spatially_uniform:
+        lines.append(
+            "  • Attention is spatially uniform within frames (no localised focus). "
+            "The explanation head may need stronger diversity regularisation."
+        )
+    elif is_temporally_frozen:
+        lines.append(
+            "  • Attention map is nearly identical across all frames (temporally frozen). "
+            "Consider reducing lambda2 (temporal consistency weight)."
+        )
+    elif is_class_agnostic:
+        lines.append(
+            "  • Attention maps are very similar across samples in this batch "
+            "(class-agnostic). The diversity loss may need increasing."
         )
     else:
         top3_labels = ", ".join(str(f + 1) for f in top3)
         lines.append(f"  • Attention was highest in frames {top3_labels}.")
 
     # Region label from peak of mean attention map across all frames
-    mean_attn = np.mean(np.stack(attention_maps), axis=0)
+    mean_attn = np.mean(M_t_up, axis=0)
     region    = get_region_label(mean_attn)
     lines.append(f"  • The primary area of concern is the {region}.")
 
@@ -239,6 +250,7 @@ def save_annotated_frame_strip(
     prob: float,
     output_path: str,
     sample_id: str,
+    batch_inter_sample_sim: float = 0.0,
 ) -> str:
     """
     Save a horizontal strip of up to 8 annotated frames plus a text panel.
@@ -280,7 +292,8 @@ def save_annotated_frame_strip(
     # Build explanation text and render onto a dark PIL panel
     confidence = prob if prob >= 0.5 else (1.0 - prob)
     text       = generate_explanation_text(
-        verdict, confidence, prob, attention_scores, attention_maps
+        verdict, confidence, prob, attention_scores, attention_maps,
+        batch_inter_sample_sim=batch_inter_sample_sim,
     )
     text_lines = text.split("\n")
     line_h     = 17

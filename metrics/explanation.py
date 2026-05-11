@@ -10,6 +10,7 @@ import torch
 import numpy as np
 from skimage.metrics import structural_similarity as ssim
 from scipy.stats import spearmanr
+from typing import Dict
 
 
 class ExplanationMetrics:
@@ -142,3 +143,53 @@ class ExplanationMetrics:
         del_auc = float(_trapz(del_scores) / steps)
         ins_auc = float(_trapz(ins_scores) / steps)
         return {"deletion_auc": del_auc, "insertion_auc": ins_auc}
+
+    @staticmethod
+    def collapse_diagnostics(all_M_t: torch.Tensor) -> Dict[str, float]:
+        """
+        Compute three collapse diagnostic metrics on the full test-set M_t tensor.
+
+        Parameters
+        ----------
+        all_M_t : (N, T, H, W)  — explanation maps for all test samples
+
+        Returns
+        -------
+        dict with keys:
+            inter_sample_cosine_mean  — mean pairwise cosine sim; < 0.5 healthy
+            peak_mode_share           — fraction of samples whose argmax lands at
+                                        the most common (row, col); < 0.2 healthy
+            m_t_std_mean              — mean M_t std across samples; > 0.13 = one-hot
+            m_t_std_max               — max  M_t std across samples
+        """
+        N, T, H, W = all_M_t.shape
+
+        # --- inter-sample cosine similarity ---
+        flat = all_M_t.mean(dim=1).reshape(N, H * W).float()   # (N, H*W) — time-averaged
+        flat_norm = flat / (flat.norm(dim=-1, keepdim=True) + 1e-8)
+        sim_matrix = flat_norm @ flat_norm.T                    # (N, N)
+        eye = torch.eye(N, dtype=torch.bool, device=all_M_t.device)
+        n_pairs = N * (N - 1)
+        inter_cosine = float(
+            sim_matrix.masked_fill(eye, 0.0).sum().item() / max(n_pairs, 1)
+        )
+
+        # --- peak-coordinate mode share ---
+        mean_maps = all_M_t.mean(dim=1)                         # (N, H, W)
+        peak_indices = mean_maps.reshape(N, -1).argmax(dim=-1)  # (N,)
+        peak_rc = [(int(idx) // W, int(idx) % W) for idx in peak_indices.tolist()]
+        from collections import Counter
+        most_common_count = Counter(peak_rc).most_common(1)[0][1]
+        peak_mode_share = float(most_common_count) / N
+
+        # --- M_t std (per-sample, time-and-space) ---
+        stds = all_M_t.std(dim=(-1, -2)).mean(dim=-1)           # (N,) mean over T
+        m_t_std_mean = float(stds.mean().item())
+        m_t_std_max  = float(stds.max().item())
+
+        return {
+            "inter_sample_cosine_mean": inter_cosine,
+            "peak_mode_share":          peak_mode_share,
+            "m_t_std_mean":             m_t_std_mean,
+            "m_t_std_max":              m_t_std_max,
+        }

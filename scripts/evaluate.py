@@ -86,7 +86,7 @@ def save_detection_graphs(probs, labels, output_dir: str) -> None:
     fig.savefig(os.path.join(output_dir, "pr_curve.png"), dpi=150)
     plt.close(fig)
 
-    # 3 — Confusion Matrix
+    # 3a — Confusion Matrix (raw counts)
     cm = confusion_matrix(labels, preds)
     fig, ax = plt.subplots(figsize=(5, 4))
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax,
@@ -96,6 +96,19 @@ def save_detection_graphs(probs, labels, output_dir: str) -> None:
     ax.set_title("Confusion Matrix")
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, "confusion_matrix.png"), dpi=150)
+    plt.close(fig)
+
+    # 3b — Confusion Matrix (row-normalised)
+    cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True).clip(min=1e-8)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    sns.heatmap(cm_norm, annot=True, fmt=".2f", cmap="Blues", ax=ax,
+                xticklabels=["Real", "Fake"], yticklabels=["Real", "Fake"],
+                vmin=0.0, vmax=1.0)
+    ax.set_ylabel("Ground Truth")
+    ax.set_xlabel("Predicted")
+    ax.set_title("Confusion Matrix (Normalised)")
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "confusion_matrix_norm.png"), dpi=150)
     plt.close(fig)
 
     # 4 — Score Distribution
@@ -111,6 +124,15 @@ def save_detection_graphs(probs, labels, output_dir: str) -> None:
     fig.savefig(os.path.join(output_dir, "score_distribution.png"), dpi=150)
     plt.close(fig)
 
+    # Verify required PNGs were written
+    required_pngs = ["roc_curve.png", "pr_curve.png",
+                     "confusion_matrix.png", "confusion_matrix_norm.png"]
+    for fname in required_pngs:
+        fpath = os.path.join(output_dir, fname)
+        if not os.path.exists(fpath):
+            raise FileNotFoundError(
+                f"[Evaluate] Required PNG not found after saving: {fpath}"
+            )
     print(f"[Evaluate] Detection graphs saved → {output_dir}")
 
 
@@ -263,12 +285,51 @@ def run_evaluation(config: EAHNConfig):
     except Exception as e:
         print(f"  [Deletion/Insertion AUC skipped: {e}]")
 
-    avg_iou_display = avg_iou if avg_iou is not None else "N/A (no masks)"
+    # ── Collapse diagnostics ──────────────────────────────────────────────────
+    collapse_diag = ExplanationMetrics.collapse_diagnostics(all_M_t_up)
+    print("Collapse Diagnostics:", collapse_diag)
+
+    # Print a warning if any guardrail trips
+    warnings_list = []
+    if collapse_diag["inter_sample_cosine_mean"] > 0.95:
+        warnings_list.append(
+            f"inter_sample_cosine_mean={collapse_diag['inter_sample_cosine_mean']:.3f} (threshold 0.95)"
+        )
+    if collapse_diag["peak_mode_share"] > 0.5:
+        warnings_list.append(
+            f"peak_mode_share={collapse_diag['peak_mode_share']:.3f} (threshold 0.5)"
+        )
+    if collapse_diag["m_t_std_mean"] > 0.13:
+        warnings_list.append(
+            f"m_t_std_mean={collapse_diag['m_t_std_mean']:.3f} (threshold 0.13)"
+        )
+    if warnings_list:
+        print("\n[COLLAPSE WARNING] Explanation collapse detected:")
+        for w in warnings_list:
+            print(f"  - {w}")
+        print("  Do NOT proceed to longer runs. Diagnose the explanation head first.\n")
+
+    # ── Adebayo model-randomization sanity check ─────────────────────────────
+    mt_vs_random_cosine = 1.0
+    try:
+        from xai.sanity_checks import model_randomization_check
+        _sample_idx     = int(indices[0])
+        _frames_sample  = test_ds[_sample_idx]["frames"].unsqueeze(0)
+        mt_vs_random_cosine = model_randomization_check(model, _frames_sample, n_random=3)
+        print(f"[Sanity] model_randomization cosine sim = {mt_vs_random_cosine:.3f} "
+              f"({'PASS < 0.7' if mt_vs_random_cosine < 0.7 else 'WARN > 0.7 — explanation insensitive to weights'})")
+    except Exception as e:
+        print(f"  [Adebayo sanity check skipped: {e}]")
+
+    # Use a string so metrics.csv shows "N/A" rather than NaN
+    avg_iou_display = f"{avg_iou:.4f}" if avg_iou is not None else "N/A"
     exp_metrics = {
-        "avg_iou":           avg_iou_display,
-        "temporal_ssim":     ssim_val,
-        "faithfulness_corr": faithful_corr,
+        "avg_iou":                    avg_iou_display,
+        "temporal_ssim":              ssim_val,
+        "faithfulness_corr":          faithful_corr,
+        "mt_vs_random_model_cosine":  mt_vs_random_cosine,
         **del_ins,
+        **collapse_diag,
     }
     print("Explanation Metrics:", exp_metrics)
 
@@ -284,25 +345,25 @@ def run_evaluation(config: EAHNConfig):
 
     # ── Heatmap generation ────────────────────────────────────────────────────
     if config.save_heatmaps:
-        _generate_heatmaps(config, model, test_ds, indices[:5], device, all_probs)
+        _generate_heatmaps(config, model, test_ds, indices[:5], device, all_probs,
+                           batch_inter_sample_sim=collapse_diag["inter_sample_cosine_mean"])
 
-    # ── User-study stimuli ────────────────────────────────────────────────────
-    try:
-        from user_study.generate_stimuli import AutomatedStimulusGenerator
-        from xai.gradcam import GradCAMExplainer
-        _gradcam = GradCAMExplainer(model, target_layer=model.spatial_stream.grad_cam_target_layer)
-        _stim_dir = os.path.join(config.output_dir, "user_study")
-        _generator = AutomatedStimulusGenerator(model, test_loader, _gradcam, config, _stim_dir)
-        _generator.generate()
-    except Exception as e:
-        print(f"  [User-study stimuli skipped: {e}]")
+    # ── Representative heatmaps (C.6) ────────────────────────────────────────
+    # Pick 1 confidently-real-correct, 1 confidently-fake-correct, 1 misclassified
+    _save_representative_heatmaps(
+        config, model, test_ds, all_probs, all_labels, device,
+        batch_inter_sample_sim=collapse_diag["inter_sample_cosine_mean"],
+        temporal_ssim=ssim_val,
+        inter_sample_cosine=collapse_diag["inter_sample_cosine_mean"],
+    )
 
     print("Evaluation complete. Outputs saved to", config.output_dir)
 
 
 # ── Heatmap + explanation helper ─────────────────────────────────────────────
 
-def _generate_heatmaps(config, model, test_ds, sample_indices, device, all_probs):
+def _generate_heatmaps(config, model, test_ds, sample_indices, device, all_probs,
+                       batch_inter_sample_sim: float = 0.0):
     from xai.gradcam import GradCAMExplainer
     from xai.attention_rollout import AttentionRolloutExplainer
     from xai.shap_explainer import SHAPExplainer
@@ -351,6 +412,7 @@ def _generate_heatmaps(config, model, test_ds, sample_indices, device, all_probs
             sampled_orig, intrinsic_maps, intrinsic_scores, verdict, prob,
             os.path.join(explanation_dir, f"{video_id}_strip.png"),
             sample_id=video_id,
+            batch_inter_sample_sim=batch_inter_sample_sim,
         )
 
         # ── Intrinsic explanation video (5f) ──────────────────────────────────
@@ -380,6 +442,140 @@ def _generate_heatmaps(config, model, test_ds, sample_indices, device, all_probs
                 sampled_orig, maps_list, scores_list, verdict, prob,
                 os.path.join(heatmap_dir, f"{video_id}_{method_name}.mp4"),
             )
+
+
+def _save_representative_heatmaps(
+    config, model, test_ds, all_probs, all_labels, device,
+    batch_inter_sample_sim: float = 0.0,
+    temporal_ssim: float = 0.0,
+    inter_sample_cosine: float = 0.0,
+):
+    """
+    Save heatmap overlay MP4 + frame strip PNG + plain-English summary TXT for
+    three representative test videos:
+      - 1 confidently-real-correct   (true real, predicted real, prob < 0.2)
+      - 1 confidently-fake-correct   (true fake, predicted fake, prob > 0.8)
+      - 1 misclassified              (any, predicted wrong)
+
+    Outputs go to  OUTPUT_DIR/heatmaps/heatmap_overlay_{video_id}.{mp4,png,txt}
+    """
+    heatmap_dir = os.path.join(config.output_dir, "heatmaps")
+    os.makedirs(heatmap_dir, exist_ok=True)
+
+    probs_arr  = np.array(all_probs)
+    labels_arr = np.array(all_labels, dtype=int)
+    preds_arr  = (probs_arr >= 0.5).astype(int)
+
+    def _find(condition_mask, max_tries=50):
+        idxs = np.where(condition_mask)[0]
+        if len(idxs) == 0:
+            return None
+        # Pick the one with most extreme probability (most confident)
+        best = idxs[np.argmax(np.abs(probs_arr[idxs] - 0.5))]
+        return int(best)
+
+    candidates = {
+        "real_correct": _find((labels_arr == 0) & (preds_arr == 0) & (probs_arr < 0.2)),
+        "fake_correct": _find((labels_arr == 1) & (preds_arr == 1) & (probs_arr > 0.8)),
+        "misclassified": _find(labels_arr != preds_arr),
+    }
+    # Fill gaps with any available sample
+    for key in list(candidates.keys()):
+        if candidates[key] is None:
+            candidates[key] = _find(labels_arr >= 0)
+
+    saved = []
+    for role, idx in candidates.items():
+        if idx is None:
+            continue
+        sample        = test_ds[idx]
+        frames_tensor = sample["frames"].unsqueeze(0).to(device)
+        video_path    = sample["meta"].get("video_path", "")
+        video_id      = (
+            os.path.splitext(os.path.basename(video_path))[0]
+            if video_path else f"sample_{idx}"
+        )
+        video_id = f"{role}_{video_id}"
+
+        orig_frames = _get_original_frames(video_path, config.num_frames, config.frame_size)
+
+        with torch.no_grad():
+            out = model(frames_tensor)
+        intrinsic      = out.M_t_up[0].cpu().numpy()   # (T, H, W)
+        prob           = float(out.prob[0].cpu())
+        verdict        = "FAKE" if prob > 0.5 else "REAL"
+        confidence     = abs(prob - 0.5) * 2.0
+        intrinsic_maps = [intrinsic[t] for t in range(intrinsic.shape[0])]
+
+        def _peakiness(m: np.ndarray) -> float:
+            flat = m.flatten().astype(np.float64) + 1e-12
+            flat = flat / flat.sum()
+            return float(1.0 - (-(flat * np.log(flat)).sum()) / np.log(flat.size))
+
+        intrinsic_scores = [_peakiness(m) for m in intrinsic_maps]
+
+        # Collapse flags for this single sample
+        sp_stds  = [float(m.std()) for m in intrinsic_maps]
+        is_uniform = float(np.mean(sp_stds)) < 0.01
+        if len(intrinsic_maps) > 1:
+            f0  = intrinsic_maps[0].flatten();  f0  = f0  / (np.linalg.norm(f0)  + 1e-8)
+            fl  = intrinsic_maps[-1].flatten(); fl  = fl  / (np.linalg.norm(fl)  + 1e-8)
+            is_frozen = float(np.dot(f0, fl)) > 0.99
+        else:
+            is_frozen = False
+        is_class_agnostic = inter_sample_cosine > 0.95
+
+        # ── MP4 overlay ─────────────────────────────────────────────────
+        mp4_path = os.path.join(heatmap_dir, f"heatmap_overlay_{video_id}.mp4")
+        save_explanation_video(
+            orig_frames, intrinsic_maps, intrinsic_scores, verdict, prob, mp4_path
+        )
+
+        # ── Frame strip PNG ──────────────────────────────────────────────
+        png_path = os.path.join(heatmap_dir, f"heatmap_strip_{video_id}.png")
+        save_annotated_frame_strip(
+            orig_frames, intrinsic_maps, intrinsic_scores, verdict, prob,
+            png_path, sample_id=video_id,
+            batch_inter_sample_sim=batch_inter_sample_sim,
+        )
+
+        # ── Plain-English summary TXT ────────────────────────────────────
+        peak_t  = int(np.argmax(intrinsic_scores))
+        mean_map = np.mean(intrinsic_maps, axis=0)
+        region   = get_region_label(mean_map)
+
+        health_notes = []
+        if is_uniform:
+            health_notes.append("Attention is spatially uniform (possible collapse).")
+        if is_frozen:
+            health_notes.append("Attention map frozen across frames (possible collapse).")
+        if is_class_agnostic:
+            health_notes.append("Heatmaps similar across all test samples (class-agnostic).")
+        if not health_notes:
+            health_notes.append(
+                f"Heatmap varies across frames (temporal_ssim={temporal_ssim:.2f}) "
+                f"and across samples (inter_sample_cosine={inter_sample_cosine:.2f}) "
+                f"— explanation looks healthy."
+            )
+
+        frame_range = f"frames {min(range(len(intrinsic_maps)), key=lambda t: intrinsic_scores[t])+1}–"
+        frame_range += f"{max(range(len(intrinsic_maps)), key=lambda t: intrinsic_scores[t])+1}"
+        summary_lines = [
+            f"Role: {role}",
+            f"Video: {video_path}",
+            f"Ground truth: {'FAKE' if all_labels[idx] == 1 else 'REAL'}",
+            f"Model predicted {verdict} with confidence {confidence:.2f} (prob={prob:.3f}).",
+            f"Attention focused on the {region}.",
+            f"Peak attention at t={peak_t+1} ({frame_range}).",
+        ] + health_notes
+        txt_path = os.path.join(heatmap_dir, f"heatmap_summary_{video_id}.txt")
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(summary_lines) + "\n")
+
+        saved.append(video_id)
+        print(f"[Representative] {role} → {video_id}  prob={prob:.3f}  verdict={verdict}")
+
+    print(f"[Representative heatmaps] Saved {len(saved)} videos: {saved}")
 
 
 def _get_original_frames(video_path: str, num_frames: int, frame_size: int):

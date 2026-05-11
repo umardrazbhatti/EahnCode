@@ -1,24 +1,33 @@
 """
 data/datasets.py  —  EAHN DeepfakeDataset
 ==========================================
-Corrected path conventions for the actual Kaggle FF++ c23 layout:
+Locked to FF++ c23 custom-layout dataset.
 
-  Fake: {data_root}/manipulated_sequences/{Method}/c23/videos/*.mp4   (label=1)
-  Real: {data_root}/original_sequences/youtube/c23/videos/*.mp4       (label=0)
+Verified folder layout on Kaggle
+(umardrazbhatti/ffpp-c23-custom-layout/ffpp_data/):
 
-No pixel-level manipulation masks exist in this dataset snapshot,
-so has_masks=False and weakly-supervised L_exp is applied throughout.
+  Real:  original_sequences/youtube/c23/videos/*.mp4          (1 000 videos, label=0)
+  Fake:  manipulated_sequences/{Method}/c23/videos/*.mp4      (1 000 per method × 5, label=1)
+         Methods: Deepfakes, Face2Face, FaceShifter, FaceSwap, NeuralTextures
 
-Class balance: each class is capped at exactly 1000 samples (random.sample with
-a fixed seed=42) giving at most 2000 balanced samples before splitting.
-self.n_real and self.n_fake are set after the split so they reflect the count
-in that particular mode (train / val / test).
+No pixel-level manipulation masks exist in this snapshot → weakly-supervised
+L_exp (entropy + TV + inter-sample diversity) throughout.
+
+Class imbalance is handled at the DataLoader level via WeightedRandomSampler
+(see scripts/train_real.py).  heavy_aug is set automatically when the class
+ratio exceeds 3:1 — on FF++ c23 this triggers heavy augmentation for the 1 000
+real videos (the minority class).
+
+Other dataset types:
+  synthetic — generated in RAM for unit tests / smoke tests
+  dfdc      — DFDC metadata.json layout
+  celeb_df  — DEFERRED to future work (raises NotImplementedError)
 """
 
 import os
 import json
-import random
 import warnings
+from pathlib import Path
 from typing import Literal
 
 import cv2
@@ -26,6 +35,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
+from sklearn.model_selection import train_test_split
 
 try:
     from decord import VideoReader, cpu as decord_cpu
@@ -38,11 +48,11 @@ except ImportError:
     )
 
 from data.face_align import FaceAligner
-from data.transforms import get_transforms
+from data.transforms import get_transforms, get_heavy_transforms
 from data.synthetic_generator import SyntheticDataGenerator
 
 # ---------------------------------------------------------------------------
-# FF++ manipulation methods present in this dataset snapshot
+# FF++ manipulation methods in this dataset snapshot
 # ---------------------------------------------------------------------------
 FF_METHODS = [
     "Deepfakes",
@@ -55,9 +65,9 @@ FF_METHODS = [
 
 class DeepfakeDataset(Dataset):
     """
-    Unified dataset loader for FF++, Celeb-DF, DFDC and synthetic data.
+    Unified dataset loader for FF++, DFDC and synthetic data.
 
-    Each __getitem__ returns a dict with keys:
+    Each __getitem__ returns a dict:
         frames    : Tensor (T, 3, H, W)  — normalised face-aligned frames
         label     : int                  — 0 = real, 1 = fake
         mask      : Tensor (h, w)        — manipulation mask or zeros
@@ -71,11 +81,13 @@ class DeepfakeDataset(Dataset):
         mode: Literal["train", "val", "test"],
         dataset_type: Literal["synthetic", "ff++", "celeb_df", "dfdc"],
     ):
-        self.config = config
-        self.mode = mode
+        self.config       = config
+        self.mode         = mode
         self.dataset_type = dataset_type
-        self.transform = get_transforms(mode, config.frame_size)
+        self.transform    = get_transforms(mode, config.frame_size)
         self.has_masks: bool = False
+        self.heavy_aug: bool = False
+        self.minority_class: int = 1
         self.samples: list[dict] = []
 
         # Face aligner — shared across all dataset types
@@ -97,7 +109,20 @@ class DeepfakeDataset(Dataset):
         else:
             raise ValueError(f"Unknown dataset_type: '{dataset_type}'")
 
-        # ── Train / val / test split ────────────────────────────────────
+        # ── Dataset-agnostic imbalance detection ─────────────────────────
+        if self.samples:
+            _labels = np.array([s["label"] for s in self.samples], dtype=int)
+            _counts = np.bincount(_labels, minlength=2)
+            _ratio  = _counts.max() / max(_counts.min(), 1)
+            self.heavy_aug      = bool(_ratio > 3.0)
+            self.minority_class = int(_counts.argmin())
+            print(
+                f"[Imbalance] real={_counts[0]} fake={_counts[1]} "
+                f"ratio={_ratio:.2f} heavy_aug={self.heavy_aug} "
+                f"minority_class={self.minority_class}"
+            )
+
+        # ── Stratified train / val / test split ──────────────────────────
         self.samples = self._split(
             self.samples, mode, config.train_split, config.val_split
         )
@@ -109,16 +134,14 @@ class DeepfakeDataset(Dataset):
                 f"Check config.data_root='{config.data_root}'."
             )
 
-        # ── Store and log class distribution (post-split counts) ────────
+        # ── Post-split class distribution ────────────────────────────────
         self.n_real = sum(1 for s in self.samples if s["label"] == 0)
         self.n_fake = sum(1 for s in self.samples if s["label"] == 1)
-        print(
-            f"[DeepfakeDataset] Balanced to {self.n_real} real + "
-            f"{self.n_fake} fake = {len(self.samples)} total"
-        )
+        _split_ratio = self.n_fake / max(self.n_real, 1)
         print(
             f"[DeepfakeDataset | {dataset_type} / {mode}] "
-            f"total={len(self.samples)}  real={self.n_real}  fake={self.n_fake}"
+            f"total={len(self.samples)}  real={self.n_real}  fake={self.n_fake}  "
+            f"ratio={_split_ratio:.1f}:1"
         )
 
     # ====================================================================
@@ -127,121 +150,109 @@ class DeepfakeDataset(Dataset):
 
     def _build_ffpp(self):
         """
-        Scans the actual FF++ c23 directory layout.
+        FF++ c23 custom-layout builder.
 
         Relative to config.data_root (= .../ffpp_data/):
-            Fake: manipulated_sequences/{Method}/c23/videos/*.mp4
             Real: original_sequences/youtube/c23/videos/*.mp4
+            Fake: manipulated_sequences/{Method}/c23/videos/*.mp4
         """
-        root = self.config.data_root
+        root      = Path(self.config.data_root)
+        real_dir  = root / "original_sequences" / "youtube" / "c23" / "videos"
+        fake_root = root / "manipulated_sequences"
 
-        # ── Real videos (label = 0) ──────────────────────────────────────
-        real_dir = os.path.join(
-            root, "original_sequences", "youtube", "c23", "videos"
-        )
-        real_paths = self._glob_mp4(real_dir)
-        if not real_paths:
-            warnings.warn(
-                f"[FF++] No real videos found at: {real_dir}\n"
-                "Check that config.data_root points to the ffpp_data/ folder."
-            )
-        for p in real_paths:
-            self.samples.append(
-                {"video_path": p, "label": 0, "mask_path": None}
-            )
-
-        # ── Fake videos (label = 1) ──────────────────────────────────────
+        real_videos = sorted(real_dir.glob("*.mp4"))
+        fake_videos: list[Path] = []
         for method in FF_METHODS:
-            fake_dir = os.path.join(
-                root, "manipulated_sequences", method, "c23", "videos"
-            )
-            fake_paths = self._glob_mp4(fake_dir)
-            if not fake_paths:
-                warnings.warn(
-                    f"[FF++] No fake videos found for method '{method}' at: {fake_dir}"
-                )
-                continue
-            for p in fake_paths:
-                self.samples.append(
-                    {"video_path": p, "label": 1, "mask_path": None}
-                )
+            d = fake_root / method / "c23" / "videos"
+            if d.exists():
+                fake_videos.extend(sorted(d.glob("*.mp4")))
+            else:
+                warnings.warn(f"[FF++] Method directory not found: {d}")
 
-        # ── Mask detection ───────────────────────────────────────────────
-        # This dataset snapshot contains no mask directories.
-        # Check anyway so the code is forward-compatible if masks are added.
-        possible_mask_root = os.path.join(
-            root, "manipulated_sequences", "FaceSwap", "c23", "masks"
+        assert len(real_videos) > 0, (
+            f"No real videos found at {real_dir}. "
+            "Check config.data_root points to ffpp_data/."
         )
-        self.has_masks = os.path.isdir(possible_mask_root)
+        assert len(fake_videos) > 0, (
+            f"No fake videos found under {fake_root}. "
+            "Check that manipulated_sequences/ subdirectories exist."
+        )
+
+        for v in real_videos:
+            self.samples.append(
+                {"video_path": str(v), "label": 0,
+                 "mask_path": None, "manipulation": "original"}
+            )
+        for v in fake_videos:
+            self.samples.append(
+                {"video_path": str(v), "label": 1,
+                 "mask_path": None,
+                 "manipulation": v.parent.parent.parent.name}
+            )
+
+        # Mask detection — forward-compatible
+        possible_mask_root = fake_root / "FaceSwap" / "c23" / "masks"
+        self.has_masks = possible_mask_root.is_dir()
         if self.has_masks:
             print("[FF++] Pixel-level masks found → supervised L_exp will be used.")
         else:
-            print("[FF++] No pixel-level masks found → weakly-supervised L_exp (entropy + TV).")
+            print("[FF++] No pixel-level masks → weakly-supervised L_exp (entropy+TV+diversity).")
 
-        # ── Balance classes ──────────────────────────────────────────────
-        # 5 methods × ~1000 fakes = ~5000 fakes vs ~1000 reals → 5:1 ratio.
-        # Cap fakes at 2× the number of reals before splitting.
-        self._balance_classes()
+        print(
+            f"[FF++ c23] real={len(real_videos)} fake={len(fake_videos)} "
+            f"total={len(self.samples)}"
+        )
 
     def _build_celeb_df(self):
-        """
-        Expected layout relative to config.data_root:
-            videos/real/*.mp4
-            videos/synthesis/*.mp4
-        No pixel-level masks available.
-        """
-        root = self.config.data_root
-        real_dir = os.path.join(root, "videos", "real")
-        fake_dir = os.path.join(root, "videos", "synthesis")
-        for p in self._glob_mp4(real_dir):
-            self.samples.append({"video_path": p, "label": 0, "mask_path": None})
-        for p in self._glob_mp4(fake_dir):
-            self.samples.append({"video_path": p, "label": 1, "mask_path": None})
-        self.has_masks = False
-        self._balance_classes()
+        """Celeb-DF v2 is deferred to future work."""
+        raise NotImplementedError(
+            "Celeb-DF v2 is deferred to future work. "
+            "Use dataset_name='ff++' for the current pipeline."
+        )
 
     def _build_dfdc(self):
         """
-        Expected layout relative to config.data_root:
+        DFDC layout relative to config.data_root:
             dfdc_train_part_*/videos/*.mp4
             dfdc_train_part_*/metadata.json
         """
-        root = self.config.data_root
-        for part in sorted(os.listdir(root)):
-            if not part.startswith("dfdc_train_part"):
+        root = Path(self.config.data_root)
+        for part in sorted(root.iterdir()):
+            if not part.name.startswith("dfdc_train_part") or not part.is_dir():
                 continue
-            part_dir = os.path.join(root, part)
-            if not os.path.isdir(part_dir):
-                continue
-            meta_path = os.path.join(part_dir, "metadata.json")
-            if not os.path.exists(meta_path):
-                warnings.warn(f"[DFDC] metadata.json not found in: {part_dir}")
+            meta_path = part / "metadata.json"
+            if not meta_path.exists():
+                warnings.warn(f"[DFDC] metadata.json not found in: {part}")
                 continue
             with open(meta_path) as f:
                 meta = json.load(f)
             for fname, info in meta.items():
-                vpath = os.path.join(part_dir, "videos", fname)
-                if not os.path.exists(vpath):
+                vpath = part / "videos" / fname
+                if not vpath.exists():
                     continue
                 label = 1 if info.get("label") == "FAKE" else 0
                 self.samples.append(
-                    {"video_path": vpath, "label": label, "mask_path": None}
+                    {"video_path": str(vpath), "label": label,
+                     "mask_path": None, "manipulation": "dfdc"}
                 )
         self.has_masks = False
-        self._balance_classes()
+        n_real = sum(1 for s in self.samples if s["label"] == 0)
+        n_fake = sum(1 for s in self.samples if s["label"] == 1)
+        print(
+            f"[DFDC] {n_real} real + {n_fake} fake = {len(self.samples)} total "
+            f"(ratio {n_fake/max(n_real,1):.1f}:1)"
+        )
 
     def _build_synthetic(self):
-        """
-        Synthetic data: generated entirely in RAM, no disk I/O.
-        Always produces masks, enabling supervised L_exp testing.
-        """
+        """Synthetic data — generated entirely in RAM, no disk I/O."""
         self.has_masks = True
         self.generator = SyntheticDataGenerator()
         n_total = 200  # 100 real + 100 fake
         for i in range(n_total):
             label = i % 2
             self.samples.append(
-                {"video_path": f"synthetic_{i}", "label": label, "mask_path": None}
+                {"video_path": f"synthetic_{i}", "label": label,
+                 "mask_path": None, "manipulation": "synthetic"}
             )
 
     # ====================================================================
@@ -259,31 +270,6 @@ class DeepfakeDataset(Dataset):
             if f.lower().endswith(".mp4")
         )
 
-    def _balance_classes(self):
-        """
-        Cap each class to exactly 1000 samples using a fixed seed for
-        reproducibility.  After balancing the dataset contains at most
-        2000 samples (1000 real + 1000 fake) before the train/val/test split.
-        """
-        real = [s for s in self.samples if s["label"] == 0]
-        fake = [s for s in self.samples if s["label"] == 1]
-
-        if not real or not fake:
-            warnings.warn(
-                "[DeepfakeDataset] One class is missing entirely before balancing. "
-                f"real={len(real)}, fake={len(fake)}. "
-                "Check that video files exist at the expected paths."
-            )
-            return
-
-        rng  = random.Random(42)
-        real = rng.sample(real, min(len(real), 1000))
-        fake = rng.sample(fake, min(len(fake), 1000))
-
-        combined = real + fake
-        random.Random(42).shuffle(combined)
-        self.samples = combined
-
     @staticmethod
     def _split(
         samples: list,
@@ -292,20 +278,63 @@ class DeepfakeDataset(Dataset):
         val_frac: float,
     ) -> list:
         """
-        Deterministic 80/10/10 split (or as configured).
-        Shuffled with seed=0 before splitting to ensure reproducibility.
+        Stratified train/val/test split via sklearn.model_selection.train_test_split.
+
+        Stratification ensures both classes are present in every split.
+        A class-presence assertion fires at construction time (not at metric time)
+        so single-class splits are caught immediately.
         """
-        data = samples[:]
-        random.Random(0).shuffle(data)
-        n = len(data)
-        n_train = int(n * train_frac)
-        n_val = int(n * val_frac)
+        if len(samples) == 0:
+            return []
+
+        labels = [s["label"] for s in samples]
+
+        # Need at least 2 samples per class to stratify
+        from collections import Counter
+        label_counts = Counter(labels)
+        if min(label_counts.values()) < 2:
+            warnings.warn(
+                f"[_split] Too few samples in minority class "
+                f"({label_counts}) — falling back to non-stratified split."
+            )
+            import random
+            data = samples[:]
+            random.Random(0).shuffle(data)
+            n = len(data)
+            n_train = int(n * train_frac)
+            n_val   = int(n * val_frac)
+            if mode == "train":
+                return data[:n_train]
+            elif mode == "val":
+                return data[n_train: n_train + n_val]
+            else:
+                return data[n_train + n_val:]
+
+        test_frac = 1.0 - train_frac - val_frac
+        train_val, test = train_test_split(
+            samples, test_size=test_frac, stratify=labels, random_state=42
+        )
+        tv_labels = [s["label"] for s in train_val]
+        val_relative = val_frac / (train_frac + val_frac)
+        train, val = train_test_split(
+            train_val, test_size=val_relative, stratify=tv_labels, random_state=42
+        )
+
+        # Class-presence assertion — catches broken splits at construction time
+        for name, split in [("train", train), ("val", val), ("test", test)]:
+            present = {s["label"] for s in split}
+            assert present == {0, 1}, (
+                f"[DeepfakeDataset] {name} split is missing a class: {present}. "
+                "Stratification failed — check that both classes exist in the data."
+            )
+            print(f"[Split] {name}: n={len(split)} classes={sorted(present)}")
+
         if mode == "train":
-            return data[:n_train]
+            return train
         elif mode == "val":
-            return data[n_train: n_train + n_val]
-        else:  # test
-            return data[n_train + n_val:]
+            return val
+        else:
+            return test
 
     # ====================================================================
     # Core Dataset interface
@@ -325,7 +354,6 @@ class DeepfakeDataset(Dataset):
                 frame_size=(self.config.frame_size, self.config.frame_size),
                 seed=seed,
             )
-            # Downsample mask to backbone stride (7×7 for 224px input at stride 32)
             h = w = self.config.frame_size // 32
             mask_np = mask_full.numpy() if hasattr(mask_full, "numpy") else mask_full
             mask_small = torch.tensor(
@@ -344,32 +372,42 @@ class DeepfakeDataset(Dataset):
         frames_np = self._read_frames(sample["video_path"])
 
         # Face alignment (uses cache if cache_dir is set)
-        video_id = os.path.splitext(os.path.basename(sample["video_path"]))[0]
+        video_id  = os.path.splitext(os.path.basename(sample["video_path"]))[0]
         frames_np = self.face_aligner.align_frames(frames_np, video_id)
 
-        # Convert to tensor via transform
+        # Heavy augmentation for minority-class samples when ratio > 3:1
+        label = sample["label"]
+        if (
+            self.mode == "train"
+            and self.heavy_aug
+            and label == self.minority_class
+        ):
+            aug = get_heavy_transforms(self.config.frame_size)
+        else:
+            aug = self.transform
+
         frames_tensor = torch.stack(
-            [self.transform(Image.fromarray(f)) for f in frames_np]
-        )  # shape: (T, 3, H, W)
+            [aug(Image.fromarray(f)) for f in frames_np]
+        )  # (T, 3, H, W)
 
         # ── Mask ─────────────────────────────────────────────────────────
         h = w = self.config.frame_size // 32  # 7 for 224px at stride 32
         if (
             self.has_masks
-            and sample["mask_path"]
+            and sample.get("mask_path")
             and os.path.exists(sample["mask_path"])
         ):
             mask_img = cv2.imread(sample["mask_path"], cv2.IMREAD_GRAYSCALE)
             mask_img = cv2.resize(mask_img, (w, h)).astype(np.float32) / 255.0
-            mask = torch.tensor(mask_img, dtype=torch.float32)
+            mask     = torch.tensor(mask_img, dtype=torch.float32)
             has_mask = True
         else:
-            mask = torch.zeros(h, w, dtype=torch.float32)
+            mask     = torch.zeros(h, w, dtype=torch.float32)
             has_mask = False
 
         return {
             "frames":   frames_tensor,
-            "label":    sample["label"],
+            "label":    label,
             "mask":     mask,
             "has_mask": has_mask,
             "meta": {
@@ -381,44 +419,42 @@ class DeepfakeDataset(Dataset):
     def _read_frames(self, video_path: str) -> list[np.ndarray]:
         """
         Uniformly samples config.num_frames frames from a video file.
-        Tries decord first (faster); falls back to OpenCV.
-        Returns a list of (H, W, 3) uint8 RGB arrays.
+        Tries decord first; falls back to OpenCV.
+        Returns list of (H, W, 3) uint8 RGB arrays.
         """
         T = self.config.num_frames
 
         if DECORD_AVAILABLE:
             try:
-                vr = VideoReader(video_path, ctx=decord_cpu(0))
-                total = len(vr)
+                vr      = VideoReader(video_path, ctx=decord_cpu(0))
+                total   = len(vr)
                 indices = np.linspace(0, total - 1, T, dtype=int).tolist()
-                batch = vr.get_batch(indices).asnumpy()  # (T, H, W, 3) RGB
+                batch   = vr.get_batch(indices).asnumpy()
                 return [batch[i] for i in range(T)]
             except Exception as exc:
                 warnings.warn(
                     f"decord failed on '{video_path}': {exc}. Using OpenCV fallback."
                 )
 
-        # ── OpenCV fallback ──────────────────────────────────────────────
-        cap = cv2.VideoCapture(video_path)
-        total = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 1)
-        target_indices = set(np.linspace(0, total - 1, T, dtype=int).tolist())
+        # OpenCV fallback
+        cap    = cv2.VideoCapture(video_path)
+        total  = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 1)
+        target = set(np.linspace(0, total - 1, T, dtype=int).tolist())
         frames: list[np.ndarray] = []
         fi = 0
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
-            if fi in target_indices:
+            if fi in target:
                 frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             fi += 1
             if len(frames) == T:
                 break
         cap.release()
 
-        # Pad with the last frame if the video was shorter than expected
         if not frames:
             frames = [np.zeros((224, 224, 3), dtype=np.uint8)]
         while len(frames) < T:
             frames.append(frames[-1].copy())
-
         return frames
