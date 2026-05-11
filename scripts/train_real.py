@@ -19,7 +19,7 @@ from config import EAHNConfig, parse_args
 from data.datasets import DeepfakeDataset
 from data.collate import deepfake_collate_fn
 from models.eahn import EAHN
-from losses.classification import ClassificationLoss
+from losses.classification import build_classification_loss
 from losses.explanation import ExplanationLoss
 from losses.temporal import TemporalConsistencyLoss
 from metrics.detection import DetectionMetrics
@@ -47,14 +47,18 @@ def main(config: EAHNConfig):
     val_ds   = DeepfakeDataset(config, "val",   config.dataset_name)
     print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
 
-    train_labels   = [s["label"] for s in train_ds.samples]
-    class_counts   = [train_labels.count(0), train_labels.count(1)]
-    class_weights  = [1.0 / c for c in class_counts]
-    sample_weights = [class_weights[lbl] for lbl in train_labels]
+    labels_arr    = np.array([s["label"] for s in train_ds.samples], dtype=int)
+    class_counts  = np.bincount(labels_arr, minlength=2)
+    class_weights = 1.0 / np.maximum(class_counts, 1)
+    sample_weights = class_weights[labels_arr]
     sampler = WeightedRandomSampler(
-        weights=sample_weights,
+        weights=torch.tensor(sample_weights, dtype=torch.double),
         num_samples=len(sample_weights),
         replacement=True,
+    )
+    print(
+        f"[Sampler] class_counts={class_counts.tolist()} "
+        f"class_weights={class_weights.tolist()}"
     )
     train_loader = DataLoader(
         train_ds, batch_size=config.batch_size, sampler=sampler,
@@ -65,6 +69,16 @@ def main(config: EAHNConfig):
         val_ds, batch_size=config.batch_size,
         num_workers=config.num_workers, collate_fn=deepfake_collate_fn,
         pin_memory=(device.type == "cuda"),
+    )
+
+    # ── First-batch class-balance smoke check ─────────────────────────────────
+    _sb = next(iter(train_loader))
+    _bl = _sb["label"].cpu().numpy().astype(int)
+    _n_real, _n_fake = int((_bl == 0).sum()), int((_bl == 1).sum())
+    print(f"[Smoke] First batch: real={_n_real} fake={_n_fake}")
+    assert _n_real > 0 and _n_fake > 0, (
+        f"First batch is single-class (real={_n_real}, fake={_n_fake}). "
+        "Sampler or split is broken — check DeepfakeDataset._split()."
     )
 
     # ── Model ─────────────────────────────────────────────────────────────────
@@ -96,7 +110,7 @@ def main(config: EAHNConfig):
         print(f"Resumed from epoch {start_epoch}, best AUC {best_auc:.4f}")
 
     # ── Losses ────────────────────────────────────────────────────────────────
-    cls_loss_fn  = ClassificationLoss()
+    cls_loss_fn  = build_classification_loss(config)
     exp_loss_fn  = ExplanationLoss(alpha=config.alpha, beta=config.beta, diversity_weight=config.attn_diversity_weight)
     temp_loss_fn = TemporalConsistencyLoss(gamma=config.gamma)
 
@@ -122,10 +136,11 @@ def main(config: EAHNConfig):
             ctx = autocast("cuda") if use_amp else contextlib.nullcontext()
 
             with ctx:
-                out    = model(frames)
-                l_cls  = cls_loss_fn(out.logit, labels)
-                l_exp  = exp_loss_fn(out.M_t, masks, has_mask)
-                l_temp = temp_loss_fn(out.M_t, out.low_level)
+                out      = model(frames)
+                l_cls    = cls_loss_fn(out.logit, labels)
+                exp_out  = exp_loss_fn(out.M_t, masks, has_mask)
+                l_exp    = exp_out.loss
+                l_temp   = temp_loss_fn(out.M_t, out.low_level)
                 _global_step = epoch * len(train_loader) + batch_idx
                 _lambda1_eff = config.lambda1 * min(1.0, _global_step / 200.0)
                 l_total = l_cls + _lambda1_eff * l_exp + config.lambda2 * l_temp
@@ -157,11 +172,14 @@ def main(config: EAHNConfig):
                 _live_tau = model.cross_attention.log_temp.exp().item()
                 print(
                     f"[LIVE E{epoch+1} B{batch_idx:03d}] "
-                    f"M_t_std={_live_std:.4f}  "
-                    f"tau={_live_tau:.3f}  "
-                    f"L_exp={l_exp.item():.4f}  "
-                    f"L_temp={l_temp.item():.6f}  "
-                    f"λ1_eff={_lambda1_eff:.4f}"
+                    f"M_t_std={_live_std:.3f}  "
+                    f"tau={_live_tau:.2f}  "
+                    f"L_cls={l_cls.item():.2f}  "
+                    f"L_H={exp_out.l_h:.2f}  "
+                    f"L_TV={exp_out.l_tv:.2f}  "
+                    f"L_div={exp_out.l_div:.2f}  "
+                    f"L_temp={l_temp.item():.4f}  "
+                    f"sample_sim={exp_out.inter_sample_sim:.2f}"
                 )
 
             running_loss += l_total.item()
@@ -171,7 +189,8 @@ def main(config: EAHNConfig):
                 f"Loss: {l_total.item():.4f} | "
                 f"Cls: {l_cls.item():.4f} | "
                 f"Exp: {l_exp.item():.4f} | "
-                f"Temp: {l_temp.item():.4f}"
+                f"Temp: {l_temp.item():.4f} | "
+                f"sim: {exp_out.inter_sample_sim:.2f}"
             )
 
         scheduler.step()

@@ -119,8 +119,12 @@ class EAHN(nn.Module):
             align_corners=False,
         ).reshape(B, T, H, W)                               # (B, T, H, W)
 
-        # CRITICAL: residual fusion creates the gradient path L_cls → attn_pool → M_t
-        final_feat = cls_out + attn_pool                    # (B, d)
+        # Stochastic CLS_out dropout: during training, randomly force classification
+        # through the attention branch only, ensuring gradient pressure flows to M_t.
+        if self.training and torch.rand(1).item() < self.config.cls_dropout_p:
+            final_feat = attn_pool
+        else:
+            final_feat = cls_out + attn_pool                # (B, d)
         logit = self.classifier(final_feat).squeeze(-1)     # (B,)
         prob  = torch.sigmoid(logit)
 
