@@ -198,10 +198,20 @@ def run_evaluation(config: EAHNConfig):
     except Exception:
         tn = fp = fn = tp = 0
 
-    # ── Save detection graphs (requires both classes) ─────────────────────────
+    # ── Save detection graphs + structured outputs to eval/ subdir ───────────
+    eval_dir   = os.path.join(config.output_dir, "eval")
+    os.makedirs(eval_dir, exist_ok=True)
+
     labels_arr = np.array(all_labels)
     if len(np.unique(labels_arr)) >= 2:
-        save_detection_graphs(all_probs, all_labels, config.output_dir)
+        save_detection_graphs(all_probs, all_labels, eval_dir)
+        # Also copy to root output_dir so Cell 9 finds them without subdir
+        import shutil as _shutil
+        for _png in ["roc_curve.png", "pr_curve.png", "confusion_matrix.png",
+                     "confusion_matrix_norm.png", "score_distribution.png"]:
+            _src = os.path.join(eval_dir, _png)
+            if os.path.exists(_src):
+                _shutil.copy2(_src, os.path.join(config.output_dir, _png))
     else:
         print("[Evaluate] Skipping detection graphs — only one class in test set.")
 
@@ -333,6 +343,17 @@ def run_evaluation(config: EAHNConfig):
     }
     print("Explanation Metrics:", exp_metrics)
 
+    # ── Mean heatmap entropy (lower = more focused) ───────────────────────────
+    def _entropy(m: np.ndarray) -> float:
+        flat = m.flatten().astype(np.float64) + 1e-12
+        flat = flat / flat.sum()
+        return float(-(flat * np.log(flat)).sum())
+
+    h_mean = float(np.mean([
+        _entropy(all_M_t_up[i].mean(0).numpy())
+        for i in range(len(all_M_t_up))
+    ]))
+
     # ── Save metrics CSV ──────────────────────────────────────────────────────
     os.makedirs(config.output_dir, exist_ok=True)
     csv_path = os.path.join(config.output_dir, "metrics.csv")
@@ -342,6 +363,60 @@ def run_evaluation(config: EAHNConfig):
         for k, v in {**det_metrics, **exp_metrics}.items():
             writer.writerow([k, v])
     print(f"Metrics saved to {csv_path}")
+
+    # ── metrics.json + report.txt → eval/ subdir ─────────────────────────────
+    import json as _json
+    N_total = len(all_labels)
+    N_real  = int(sum(1 for l in all_labels if l == 0))
+    N_fake  = int(sum(1 for l in all_labels if l == 1))
+    auc_roc = float(det_metrics.get("auc_roc", 0.0))
+    auc_pr  = float(det_metrics.get("auc_pr",  0.0))
+    f1      = float(det_metrics.get("f1",      0.0))
+    acc     = float(det_metrics.get("accuracy", 0.0))
+    prec    = float(det_metrics.get("precision", 0.0))
+    rec     = float(det_metrics.get("recall",   0.0))
+    ins_auc = float(del_ins.get("insertion_auc", 0.0))
+    del_auc = float(del_ins.get("deletion_auc",  0.0))
+
+    metrics_json = {
+        "auc_roc": auc_roc, "auc_pr": auc_pr, "f1": f1,
+        "accuracy": acc, "precision": prec, "recall": rec,
+        "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
+        "threshold": 0.5,
+        "h_mean": h_mean,
+        "temporal_ssim": float(ssim_val),
+        "insertion_auc": ins_auc,
+        "deletion_auc": del_auc,
+    }
+    json_path = os.path.join(eval_dir, "metrics.json")
+    with open(json_path, "w") as f:
+        _json.dump(metrics_json, f, indent=2)
+    print(f"[Evaluate] metrics.json saved → {json_path}")
+
+    faithful_str = "yes" if ins_auc > del_auc else "NO — heatmap not predictive"
+    report = (
+        "EAHN Detection Report\n"
+        "---------------------\n"
+        f"Tested {N_total} videos ({N_real} real, {N_fake} fake).\n"
+        f"AUC-ROC: {auc_roc:.3f}    AUC-PR: {auc_pr:.3f}    F1: {f1:.3f}\n"
+        f"At threshold 0.5:\n"
+        f"  True positives  (fakes caught) : {tp}/{N_fake}\n"
+        f"  False negatives (fakes missed) : {fn}/{N_fake}\n"
+        f"  True negatives  (real correct) : {tn}/{N_real}\n"
+        f"  False positives (real flagged) : {fp}/{N_real}\n"
+        f"\n"
+        f"Explanation quality:\n"
+        f"  Mean heatmap entropy : {h_mean:.3f}    (lower = more focused)\n"
+        f"  Temporal SSIM        : {ssim_val:.3f}      (1.0 = frozen across time)\n"
+        f"  Insertion AUC        : {ins_auc:.3f}\n"
+        f"  Deletion AUC         : {del_auc:.3f}\n"
+        f"  Faithful? {faithful_str}\n"
+    )
+    report_path = os.path.join(eval_dir, "report.txt")
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(report)
+    print(f"[Evaluate] report.txt saved → {report_path}")
+    print(report)
 
     # ── Heatmap generation ────────────────────────────────────────────────────
     if config.save_heatmaps:

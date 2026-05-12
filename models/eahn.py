@@ -78,6 +78,12 @@ class EAHN(nn.Module):
         nn.init.xavier_uniform_(self.classifier.weight)
         nn.init.zeros_(self.classifier.bias)
 
+    def enable_gradient_checkpointing(self):
+        if hasattr(self.temporal_stream, "enable_gradient_checkpointing"):
+            self.temporal_stream.enable_gradient_checkpointing()
+        if hasattr(self.spatial_stream, "set_grad_checkpointing"):
+            self.spatial_stream.set_grad_checkpointing(True)   # timm backbone support
+
     # ── forward ───────────────────────────────────────────────────────────────
 
     def forward(self, frames: torch.Tensor) -> EAHNOutput:

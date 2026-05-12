@@ -7,6 +7,7 @@ Returns temporal queries Q (B, T*N, d_model) and CLS embedding cls_out (B, d_mod
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as _ckpt
 import math
 
 
@@ -70,6 +71,10 @@ class TemporalStream(nn.Module):
         ])
         self.norm = nn.LayerNorm(d_model)
         self.layer_attention_weights: list = []
+        self._grad_ckpt = False
+
+    def enable_gradient_checkpointing(self):
+        self._grad_ckpt = True
 
     def forward(self, spatial_tokens: torch.Tensor):
         """
@@ -88,7 +93,10 @@ class TemporalStream(nn.Module):
 
         self.layer_attention_weights = []
         for layer in self.layers:
-            x = layer(x)
+            if self._grad_ckpt and self.training:
+                x = _ckpt.checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
             self.layer_attention_weights.append(layer.attn_weights)  # (B, N+1, N+1)
 
         x = self.norm(x)

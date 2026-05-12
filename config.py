@@ -54,12 +54,16 @@ class EAHNConfig:
 
     # ── Training ──────────────────────────────────────────────────────────────
     epochs: int = 50
-    batch_size: int = 8        # T4-safe: B*T=8*16=128 frames/fwd pass; use grad_accum_steps=2 for effective 16
-    grad_accum_steps: int = 2
+    batch_size: int = 4        # T4-safe with AMP+grad_ckpt: B*T=4*16=64 frames; grad_accum_steps=4 → effective 16
+    grad_accum_steps: int = 4
     lr: float = 1e-4
     weight_decay: float = 1e-2
-    mixed_precision: bool = True
+    mixed_precision: bool = True   # kept for backward compat; use_amp is the authoritative flag
     num_workers: int = 0   # 0 = safe for Kaggle CUDA; increase locally if desired
+    use_amp: bool = True           # FP16 automatic mixed precision (T4 supports FP16 not BF16)
+    amp_dtype: str = "fp16"        # "fp16" | "bf16"
+    grad_checkpoint: bool = True   # gradient checkpointing in TemporalStream to cut VRAM
+    clip_grad_norm: float = 1.0    # max gradient norm for clipping
 
     # ── Evaluation / Visualisation ────────────────────────────────────────────
     eval_after_train: bool = True
@@ -84,6 +88,8 @@ class EAHNConfig:
         self.transformer_heads = 2
         self.batch_size = 2
         self.mixed_precision = False
+        self.use_amp = False
+        self.grad_checkpoint = False
         self.num_workers = 0
         if "efficientnet_b4" in self.backbone:
             self.backbone = "efficientnet_b0"
@@ -130,4 +136,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--focal_alpha", type=float, default=None)
     parser.add_argument("--focal_gamma", type=float, default=None)
     parser.add_argument("--grad_accum_steps", type=int, default=None)
+    parser.add_argument("--use_amp", dest="use_amp", action="store_true", default=None)
+    parser.add_argument("--no_amp", dest="use_amp", action="store_false")
+    parser.add_argument("--amp_dtype", type=str, default=None, choices=["fp16", "bf16"])
+    parser.add_argument("--grad_checkpoint", dest="grad_checkpoint", action="store_true", default=None)
+    parser.add_argument("--no_grad_checkpoint", dest="grad_checkpoint", action="store_false")
+    parser.add_argument("--clip_grad_norm", type=float, default=None)
     return parser.parse_args()

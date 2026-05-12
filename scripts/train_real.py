@@ -10,6 +10,7 @@ Fixes vs original:
 
 import os
 import math
+import contextlib
 import torch
 import numpy as np
 from torch.utils.data import DataLoader, WeightedRandomSampler
@@ -83,6 +84,11 @@ def main(config: EAHNConfig):
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model     = EAHN(config).to(device)
+
+    if config.grad_checkpoint:
+        model.enable_gradient_checkpointing()
+        print("[GradCkpt] Gradient checkpointing enabled on TemporalStream.")
+
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config.lr, weight_decay=config.weight_decay
     )
@@ -90,13 +96,16 @@ def main(config: EAHNConfig):
         optimizer, T_max=config.epochs, eta_min=1e-6
     )
 
-    # Mixed precision — requires CUDA capability sm_70+ (Volta and above)
-    use_amp = (
-        config.mixed_precision
+    # AMP — FP16 on T4 (sm_75). BF16 only on Ampere+. Disable on CPU.
+    _use_amp = (
+        config.use_amp
         and device.type == "cuda"
         and torch.cuda.get_device_capability(device)[0] >= 7
     )
-    scaler  = GradScaler("cuda") if use_amp else None
+    _amp_dtype = torch.float16 if config.amp_dtype == "fp16" else torch.bfloat16
+    _dev_str   = device.type   # "cuda" or "cpu"
+    scaler     = GradScaler(_dev_str, enabled=_use_amp)
+    print(f"[AMP] use_amp={_use_amp}  dtype={config.amp_dtype}")
 
     logger  = Logger(config.output_dir)
 
@@ -127,7 +136,6 @@ def main(config: EAHNConfig):
     ckpt_path = os.path.join(config.output_dir, "best_model.pth")
 
     # ── Training loop ─────────────────────────────────────────────────────────
-    import contextlib
     total_batches = len(train_loader)
     epoch_w = len(str(config.epochs))
     batch_w = len(str(total_batches))
@@ -135,17 +143,15 @@ def main(config: EAHNConfig):
     for epoch in range(start_epoch, config.epochs):
         model.train()
         running_loss = 0.0
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         for batch_idx, batch in enumerate(train_loader):
-            frames   = batch["frames"].to(device)
-            labels   = batch["label"].to(device)
-            masks    = batch["mask"].to(device)
-            has_mask = batch["has_mask"].to(device)
+            frames   = batch["frames"].to(device, non_blocking=True)
+            labels   = batch["label"].to(device, non_blocking=True)
+            masks    = batch["mask"].to(device, non_blocking=True)
+            has_mask = batch["has_mask"].to(device, non_blocking=True)
 
-            ctx = autocast("cuda") if use_amp else contextlib.nullcontext()
-
-            with ctx:
+            with autocast(_dev_str, enabled=_use_amp, dtype=_amp_dtype):
                 out      = model(frames)
                 l_cls    = cls_loss_fn(out.logit, labels)
                 exp_out  = exp_loss_fn(out.M_t, masks, has_mask)
@@ -156,21 +162,14 @@ def main(config: EAHNConfig):
                 l_total = l_cls + _lambda1_eff * l_exp + config.lambda2 * l_temp
                 loss    = l_total / config.grad_accum_steps
 
-            if use_amp:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+            scaler.scale(loss).backward()
 
             if (batch_idx + 1) % config.grad_accum_steps == 0:
-                if use_amp:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                optimizer.zero_grad()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
 
             if epoch == 0 and batch_idx == 0:
                 print(f"[DIAG] M_t mean={out.M_t.mean():.4f} std={out.M_t.std():.4f}")
