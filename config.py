@@ -54,8 +54,8 @@ class EAHNConfig:
 
     # ── Training ──────────────────────────────────────────────────────────────
     epochs: int = 50
-    batch_size: int = 16
-    grad_accum_steps: int = 1
+    batch_size: int = 8        # T4-safe: B*T=8*16=128 frames/fwd pass; use grad_accum_steps=2 for effective 16
+    grad_accum_steps: int = 2
     lr: float = 1e-4
     weight_decay: float = 1e-2
     mixed_precision: bool = True
