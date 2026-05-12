@@ -29,9 +29,12 @@ class FocalLoss(nn.Module):
         self.gamma = gamma
 
     def forward(self, logit: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # prob: sigmoid output in [0,1], shape (B,)
+        target = target.float()
+        if logit.shape != target.shape:
+            target = target.view_as(logit)
+        # numerically stable: use bce_with_logits, then compute focal factor from sigmoid
+        bce  = F.binary_cross_entropy_with_logits(logit, target, reduction='none')
         prob = torch.sigmoid(logit)
-        bce  = F.binary_cross_entropy(prob, target.float(), reduction='none')
         pt   = torch.where(target.bool(), prob, 1 - prob)
         focal = self.alpha * (1 - pt).pow(self.gamma) * bce
         return focal.mean()

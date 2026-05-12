@@ -42,17 +42,20 @@ class EAHNConfig:
     gamma: float = 0.1     # gate decay rate in L_temp (was 10.0 — caused exp→0)
     attn_temp_init: float = 1.386   # log(4.0) — learnable cross-attention temperature init
     attn_diversity_weight: float = 2.5  # weight for attention diversity penalty in L_exp
-    cls_dropout_p: float = 0.3    # probability of dropping CLS_out to force gradient through attn branch
+    # Phase 5c: lowered 0.3→0.1 while classifier is still learning.
+    # Re-raise to 0.3 once val AUC-ROC > 0.7 to keep CLS_out from
+    # free-riding the attention branch.
+    cls_dropout_p: float = 0.1    # probability of dropping CLS_out to force gradient through attn branch
 
     # ── Classification loss ───────────────────────────────────────────────────
-    cls_loss_type: str = "bce"   # "bce" | "focal"
+    cls_loss_type: str = "focal"   # "bce" | "focal"
     focal_alpha: float = 0.25
     focal_gamma: float = 2.0
 
     # ── Training ──────────────────────────────────────────────────────────────
     epochs: int = 50
-    batch_size: int = 8
-    grad_accum_steps: int = 2
+    batch_size: int = 16
+    grad_accum_steps: int = 1
     lr: float = 1e-4
     weight_decay: float = 1e-2
     mixed_precision: bool = True
@@ -126,4 +129,5 @@ def parse_args() -> argparse.Namespace:
                         choices=["bce", "focal"])
     parser.add_argument("--focal_alpha", type=float, default=None)
     parser.add_argument("--focal_gamma", type=float, default=None)
+    parser.add_argument("--grad_accum_steps", type=int, default=None)
     return parser.parse_args()

@@ -19,7 +19,7 @@ from config import EAHNConfig, parse_args
 from data.datasets import DeepfakeDataset
 from data.collate import deepfake_collate_fn
 from models.eahn import EAHN
-from losses.classification import build_classification_loss
+from losses.classification import build_classification_loss, FocalLoss
 from losses.explanation import ExplanationLoss
 from losses.temporal import TemporalConsistencyLoss
 from metrics.detection import DetectionMetrics
@@ -110,7 +110,17 @@ def main(config: EAHNConfig):
         print(f"Resumed from epoch {start_epoch}, best AUC {best_auc:.4f}")
 
     # ── Losses ────────────────────────────────────────────────────────────────
-    cls_loss_fn  = build_classification_loss(config)
+    if config.cls_loss_type == "focal":
+        cls_loss_fn = FocalLoss(
+            alpha=config.focal_alpha,
+            gamma=config.focal_gamma,
+        )
+        print(f"[ClsLoss] FocalLoss(alpha={config.focal_alpha}, gamma={config.focal_gamma})")
+    elif config.cls_loss_type == "bce":
+        cls_loss_fn = torch.nn.BCEWithLogitsLoss()
+        print("[ClsLoss] BCEWithLogitsLoss")
+    else:
+        raise ValueError(f"Unknown cls_loss_type: {config.cls_loss_type}")
     exp_loss_fn  = ExplanationLoss(alpha=config.alpha, beta=config.beta, diversity_weight=config.attn_diversity_weight)
     temp_loss_fn = TemporalConsistencyLoss(gamma=config.gamma)
 
@@ -164,7 +174,7 @@ def main(config: EAHNConfig):
 
             if epoch == 0 and batch_idx == 0:
                 print(f"[DIAG] M_t mean={out.M_t.mean():.4f} std={out.M_t.std():.4f}")
-                print(f"[DIAG] L_cls={l_cls.item():.4f} L_exp={l_exp.item():.4f} L_temp={l_temp.item():.4f}")
+                print(f"[DIAG] L_cls={l_cls.item():.6f} L_exp={l_exp.item():.6f} L_temp={l_temp.item():.6f}")
                 print(f"[DIAG] attn_temp=exp({model.cross_attention.log_temp.item():.3f})={torch.exp(model.cross_attention.log_temp).item():.3f}")
 
             if batch_idx % 20 == 0:
@@ -174,22 +184,27 @@ def main(config: EAHNConfig):
                     f"[LIVE E{epoch+1} B{batch_idx:03d}] "
                     f"M_t_std={_live_std:.3f}  "
                     f"tau={_live_tau:.2f}  "
-                    f"L_cls={l_cls.item():.2f}  "
-                    f"L_H={exp_out.l_h:.2f}  "
-                    f"L_TV={exp_out.l_tv:.2f}  "
-                    f"L_div={exp_out.l_div:.2f}  "
-                    f"L_temp={l_temp.item():.4f}  "
+                    f"L_cls={l_cls.item():.6f}  "
+                    f"L_H={exp_out.l_h:.6f}  "
+                    f"L_TV={exp_out.l_tv:.6f}  "
+                    f"L_div={exp_out.l_div:.6f}  "
+                    f"L_temp={l_temp.item():.6f}  "
                     f"sample_sim={exp_out.inter_sample_sim:.2f}"
                 )
+
+            if (batch_idx + 1) % 50 == 0:
+                bl = batch["label"].detach().cpu().numpy().astype(int)
+                n_real, n_fake = int((bl == 0).sum()), int((bl == 1).sum())
+                print(f"[BatchBalance] step={batch_idx+1} real={n_real} fake={n_fake}")
 
             running_loss += l_total.item()
             print(
                 f"Epoch {epoch + 1:>{epoch_w}}/{config.epochs} | "
                 f"Batch {batch_idx + 1:>{batch_w}}/{total_batches} | "
-                f"Loss: {l_total.item():.4f} | "
-                f"Cls: {l_cls.item():.4f} | "
-                f"Exp: {l_exp.item():.4f} | "
-                f"Temp: {l_temp.item():.4f} | "
+                f"Loss: {l_total.item():.6f} | "
+                f"Cls: {l_cls.item():.6f} | "
+                f"Exp: {l_exp.item():.6f} | "
+                f"Temp: {l_temp.item():.6f} | "
                 f"sim: {exp_out.inter_sample_sim:.2f}"
             )
 

@@ -11,13 +11,16 @@ import numpy as np
 from typing import Optional
 
 
-def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-    """Mean cosine similarity between two (T, H, W) explanation maps."""
-    a_flat = a.reshape(-1)
-    b_flat = b.reshape(-1)
-    norm_a = np.linalg.norm(a_flat) + 1e-8
-    norm_b = np.linalg.norm(b_flat) + 1e-8
-    return float(np.dot(a_flat / norm_a, b_flat / norm_b))
+def _cosine_sim(a: np.ndarray, b: np.ndarray, eps: float = 1e-8) -> float:
+    """Cosine similarity between two explanation maps, with NaN guard for degenerate inputs."""
+    a_flat = a.reshape(-1).astype(float)
+    b_flat = b.reshape(-1).astype(float)
+    if a_flat.sum() < eps or b_flat.sum() < eps:
+        print("[WARN] _cosine_sim: one or both maps are near-zero — returning NaN")
+        return float("nan")
+    num = float(np.dot(a_flat, b_flat))
+    den = float(np.linalg.norm(a_flat) * np.linalg.norm(b_flat)) + eps
+    return float(np.clip(num / den, -1.0, 1.0))
 
 
 def _get_M_t(model, frames: torch.Tensor) -> np.ndarray:
