@@ -35,13 +35,13 @@ class EAHNConfig:
     dropout: float = 0.1
 
     # ── Loss weights ──────────────────────────────────────────────────────────
-    lambda1: float = 1.0   # L_exp weight
+    lambda1: float = 1.5   # L_exp weight (raised 1.0→1.5 phase5d: stronger explanation supervision)
     lambda2: float = 0.1   # L_temp weight (was 0.5 — reduced to avoid freezing heatmaps)
     alpha: float = 0.2     # entropy weight in weak supervision (was 0.5 — reduced to avoid one-hot collapse)
     beta: float = 0.5      # TV weight in weak supervision
     gamma: float = 0.1     # gate decay rate in L_temp (was 10.0 — caused exp→0)
     attn_temp_init: float = 1.386   # log(4.0) — learnable cross-attention temperature init
-    attn_diversity_weight: float = 2.5  # weight for attention diversity penalty in L_exp
+    attn_diversity_weight: float = 4.0  # weight for attention diversity penalty in L_exp (raised 2.5→4.0 phase5d: prevent spatial mode collapse)
     # Phase 5c: lowered 0.3→0.1 while classifier is still learning.
     # Re-raise to 0.3 once val AUC-ROC > 0.7 to keep CLS_out from
     # free-riding the attention branch.
@@ -50,7 +50,7 @@ class EAHNConfig:
     # ── Classification loss ───────────────────────────────────────────────────
     cls_loss_type: str = "focal"   # "bce" | "focal"
     focal_alpha: float = 0.25
-    focal_gamma: float = 2.0
+    focal_gamma: float = 1.5  # lowered 2.0→1.5 phase5d: better gradient flow on real class in early epochs
 
     # ── Training ──────────────────────────────────────────────────────────────
     epochs: int = 50

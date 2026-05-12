@@ -224,7 +224,18 @@ def main(config: EAHNConfig):
         print(
             f"Epoch {epoch + 1:>{epoch_w}}/{config.epochs} | "
             f"Val AUC-ROC: {metrics['auc_roc']:.4f} | "
-            f"F1: {metrics['f1']:.4f}"
+            f"F1: {metrics['f1_at_0.5']:.4f}"
+        )
+
+        # Per-class accuracy for diagnosing real/fake imbalance during training
+        _val_real_acc = float(metrics.get("real_accuracy", 0.0))
+        _val_fake_acc = float(metrics.get("fake_accuracy", 0.0))
+        _val_bal_acc  = float(metrics.get("balanced_accuracy", 0.0))
+        print(
+            f"[ValMetrics] epoch={epoch + 1} "
+            f"real_acc={_val_real_acc:.3f} "
+            f"fake_acc={_val_fake_acc:.3f} "
+            f"balanced_acc={_val_bal_acc:.3f}"
         )
 
         # Save best

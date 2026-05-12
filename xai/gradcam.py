@@ -45,6 +45,13 @@ class _ScalarOutputTarget:
 
 class GradCAMExplainer:
     def __init__(self, eahn_model, target_layer: nn.Module):
+        """
+        NOTE: GradCAM is computed on the SpatialStream alone (backbone → proj →
+        global_avg_pool → linear).  This is a spatial-stream approximation of the
+        full EAHN explanation, not a faithful attribution of the CLS-token-based
+        classifier. It is used as a post-hoc comparison baseline, not as a primary
+        explanation. The primary explanation is M_t from CrossAttentionFusion.
+        """
         self.model = eahn_model
         device = eahn_model.config.device
 

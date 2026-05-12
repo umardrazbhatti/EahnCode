@@ -15,6 +15,42 @@ import cv2
 import numpy as np
 
 
+# ── Browser-compatible codec helper ──────────────────────────────────────────
+
+_FOURCC = None   # cached after first call
+
+
+def _get_fourcc() -> int:
+    """
+    Return the best available VideoWriter fourcc for browser-playable MP4.
+
+    Tries H.264 (avc1) first — required for IPython.display.Video inline
+    playback in Kaggle notebooks.  Falls back to mp4v if avc1 is unavailable
+    (e.g. OpenCV built without x264).
+
+    The result is cached in _FOURCC so the codec test runs only once per
+    process.
+    """
+    global _FOURCC
+    if _FOURCC is not None:
+        return _FOURCC
+    test_path = "/tmp/_codec_test.mp4"
+    try:
+        w = cv2.VideoWriter(
+            test_path,
+            cv2.VideoWriter_fourcc(*"avc1"),
+            5, (16, 16),
+        )
+        if w.isOpened():
+            w.release()
+            _FOURCC = cv2.VideoWriter_fourcc(*"avc1")
+            return _FOURCC
+    except Exception:
+        pass
+    _FOURCC = cv2.VideoWriter_fourcc(*"mp4v")
+    return _FOURCC
+
+
 # ── overlay_heatmap_on_frame ──────────────────────────────────────────────────
 
 def overlay_heatmap_on_frame(
@@ -365,7 +401,7 @@ def save_explanation_video(
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    fourcc = _get_fourcc()
     writer = cv2.VideoWriter(output_path, fourcc, fps, (224, 224 + 80))
 
     for t in range(T):

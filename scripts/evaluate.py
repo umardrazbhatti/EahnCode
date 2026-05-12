@@ -324,7 +324,7 @@ def run_evaluation(config: EAHNConfig):
     try:
         from xai.sanity_checks import model_randomization_check
         _sample_idx     = int(indices[0])
-        _frames_sample  = test_ds[_sample_idx]["frames"].unsqueeze(0)
+        _frames_sample  = test_ds[_sample_idx]["frames"].unsqueeze(0).to(device)
         mt_vs_random_cosine = model_randomization_check(model, _frames_sample, n_random=3)
         print(f"[Sanity] model_randomization cosine sim = {mt_vs_random_cosine:.3f} "
               f"({'PASS < 0.7' if mt_vs_random_cosine < 0.7 else 'WARN > 0.7 — explanation insensitive to weights'})")
@@ -369,17 +369,33 @@ def run_evaluation(config: EAHNConfig):
     N_total = len(all_labels)
     N_real  = int(sum(1 for l in all_labels if l == 0))
     N_fake  = int(sum(1 for l in all_labels if l == 1))
-    auc_roc = float(det_metrics.get("auc_roc", 0.0))
-    auc_pr  = float(det_metrics.get("auc_pr",  0.0))
-    f1      = float(det_metrics.get("f1",      0.0))
-    acc     = float(det_metrics.get("accuracy", 0.0))
-    prec    = float(det_metrics.get("precision", 0.0))
-    rec     = float(det_metrics.get("recall",   0.0))
-    ins_auc = float(del_ins.get("insertion_auc", 0.0))
-    del_auc = float(del_ins.get("deletion_auc",  0.0))
+    auc_roc   = float(det_metrics.get("auc_roc",   0.0))
+    auc_pr    = float(det_metrics.get("auc_pr",    0.0))
+    f1        = float(det_metrics.get("f1_at_0.5", 0.0))
+    acc       = float(det_metrics.get("accuracy",  0.0))
+    prec      = float(det_metrics.get("precision", 0.0))
+    rec       = float(det_metrics.get("recall",    0.0))
+    ins_auc   = float(del_ins.get("insertion_auc", 0.0))
+    del_auc   = float(del_ins.get("deletion_auc",  0.0))
+
+    # Per-class and threshold-optimal metrics (CHANGE 3)
+    real_acc  = float(det_metrics.get("real_accuracy",              0.0))
+    fake_acc  = float(det_metrics.get("fake_accuracy",              0.0))
+    bal_acc   = float(det_metrics.get("balanced_accuracy",          0.0))
+    opt_thr   = float(det_metrics.get("optimal_threshold",          0.5))
+    f1_opt    = float(det_metrics.get("f1_at_optimal",             0.0))
+    bal_opt   = float(det_metrics.get("balanced_accuracy_at_optimal", 0.0))
 
     metrics_json = {
-        "auc_roc": auc_roc, "auc_pr": auc_pr, "f1": f1,
+        "auc_roc":                      auc_roc,
+        "auc_pr":                       auc_pr,
+        "f1_at_0.5":                    f1,
+        "balanced_accuracy":            bal_acc,
+        "real_accuracy":                real_acc,
+        "fake_accuracy":                fake_acc,
+        "optimal_threshold":            opt_thr,
+        "f1_at_optimal":               f1_opt,
+        "balanced_accuracy_at_optimal": bal_opt,
         "accuracy": acc, "precision": prec, "recall": rec,
         "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
         "threshold": 0.5,
@@ -398,7 +414,10 @@ def run_evaluation(config: EAHNConfig):
         "EAHN Detection Report\n"
         "---------------------\n"
         f"Tested {N_total} videos ({N_real} real, {N_fake} fake).\n"
-        f"AUC-ROC: {auc_roc:.3f}    AUC-PR: {auc_pr:.3f}    F1: {f1:.3f}\n"
+        f"AUC-ROC: {auc_roc:.3f}    AUC-PR: {auc_pr:.3f}    F1 (thr=0.5): {f1:.3f}\n"
+        f"Per-class accuracy: Real={real_acc:.3f}  Fake={fake_acc:.3f}\n"
+        f"Balanced accuracy: {bal_acc:.3f} (at thr=0.5)  |  {bal_opt:.3f} (at optimal thr={opt_thr:.3f})\n"
+        f"F1 at optimal threshold: {f1_opt:.3f}\n"
         f"At threshold 0.5:\n"
         f"  True positives  (fakes caught) : {tp}/{N_fake}\n"
         f"  False negatives (fakes missed) : {fn}/{N_fake}\n"
