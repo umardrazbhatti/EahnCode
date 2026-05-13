@@ -59,21 +59,22 @@ class CrossAttentionFusion(nn.Module):
         M_flat = A.mean(dim=-2)          # (B·T, L)
         M_t    = M_flat.reshape(B, T, h, w)
 
-        # ── CHANGE 8: softmax normalisation (replaces min-max) ────────────────
-        # Softmax turns M_t into a spatial probability distribution (sums to 1
-        # per frame), preventing min-max from amplifying noise in near-uniform
-        # maps into falsely sharp corner peaks (the 44% peak_mode_share bug).
+        # CHANGE 2 (phase7): softmax-only. The previous rescale-by-max divided
+        # a near-uniform softmax distribution by its own (near-uniform) max,
+        # mapping uniform attention to the constant 1.0 — destroying every
+        # spatial signal. Softmax outputs are already in [0,1] mathematically.
+        # Visualisation code does its own per-frame normalisation downstream.
         M_t = M_t.reshape(B, T, h * w)
-        M_t = torch.softmax(M_t, dim=-1)    # per-frame probability distribution
+        M_t = torch.softmax(M_t, dim=-1)       # spatial probability distribution
         M_t = M_t.reshape(B, T, h, w)
-        # Rescale to [0, 1] for visualisation compatibility
-        M_max = M_t.amax(dim=(-1, -2), keepdim=True).clamp_min(1e-8)
-        M_t   = M_t / M_max
 
-        # Attention-weighted spatial pooling for classifier gradient path.
-        # CRITICAL: grad(L_cls) → attn_pool → M_flat → A → Q, K projections → M_t
-        M_weights = M_flat.unsqueeze(-1)                                      # (B·T, L, 1)
-        S_pool    = (M_weights * Vp).sum(dim=1) / (M_weights.sum(dim=1) + 1e-8)  # (B·T, d)
-        attn_pool = S_pool.reshape(B, T, d).mean(dim=1)                       # (B, d)
+        # CHANGE 3 (phase7): use the softmax'd, normalised M_t as pool weights
+        # instead of pre-softmax M_flat (which is row-stochastic-and-uniform
+        # → degenerate flat mean). Now classifier gradient w.r.t. M_t is
+        # non-degenerate, and L_cls actually pressures attention to learn.
+        L_local = h * w
+        W = M_t.reshape(B * T, L_local, 1)             # (B·T, L, 1), sums to 1 per frame
+        S_pool    = (W * Vp).sum(dim=1)                # (B·T, d), true weighted pool
+        attn_pool = S_pool.reshape(B, T, d).mean(dim=1) # (B, d)
 
         return M_t, attn_pool

@@ -70,6 +70,17 @@ def main(config: EAHNConfig):
         random.shuffle(new_samples)
         train_ds.samples = new_samples
         print(f"[balance] train set is now {len(train_ds.samples)} samples total")
+        # CHANGE 1 (phase7): recompute imbalance gate on the BALANCED set,
+        # otherwise heavy augmentation is applied only to "real" samples and
+        # the model learns aug-pattern → label, not face → label.
+        _bal_labels = np.array([s["label"] for s in train_ds.samples], dtype=int)
+        _bal_counts = np.bincount(_bal_labels, minlength=2)
+        _bal_ratio  = _bal_counts.max() / max(_bal_counts.min(), 1)
+        train_ds.heavy_aug      = bool(_bal_ratio > 3.0)
+        train_ds.minority_class = int(_bal_counts.argmin())
+        print(f"[balance] post-resample: real={_bal_counts[0]} fake={_bal_counts[1]} "
+              f"ratio={_bal_ratio:.2f} heavy_aug={train_ds.heavy_aug} "
+              f"minority_class={train_ds.minority_class}")
 
     # ── CHANGE 2: WeightedRandomSampler safety net ────────────────────────────
     train_labels  = [s["label"] for s in train_ds.samples]
@@ -169,6 +180,28 @@ def main(config: EAHNConfig):
         "val_real_acc":        [], "val_fake_acc":          [],
         "val_inter_sample_cos": [], "val_mt_std":           [],
     }
+
+    # CHANGE 6 (phase7): build a parallel "clean" loader using the val
+    # transform (no augmentation) but the train sample list. If the model
+    # later reports high train accuracy on the augmented loader but low
+    # accuracy on this clean loader, the model is learning the augmentation
+    # pattern, not face features.
+    from copy import deepcopy
+    import torch as _torch
+    _clean_ds = deepcopy(train_ds)
+    _clean_ds.heavy_aug = False
+    # Force every getitem to use the VAL transform (deterministic resize+norm):
+    from data.transforms import get_transforms
+    _clean_ds.transform = get_transforms("val", config.frame_size)
+    # Also disable the heavy-aug branch entirely by setting minority_class to
+    # a sentinel that never matches any real label:
+    _clean_ds.minority_class = -1
+    _clean_loader = DataLoader(
+        _clean_ds, batch_size=config.batch_size,
+        num_workers=config.num_workers, collate_fn=deepfake_collate_fn,
+        pin_memory=(config.device == "cuda"),
+    )
+    print(f"[sanity] clean (unaugmented) train loader built: {len(_clean_ds)} samples")
 
     # ── Training loop ─────────────────────────────────────────────────────────
     total_batches = len(train_loader)
@@ -314,6 +347,28 @@ def main(config: EAHNConfig):
         history["val_fake_acc"].append(_val_fake_acc)
         history["val_inter_sample_cos"].append(diag_cosine)
         history["val_mt_std"].append(diag_std)
+
+        # CHANGE 6 cont.: deterministic-aug train accuracy
+        model.eval()
+        _clean_probs, _clean_labels = [], []
+        with _torch.no_grad():
+            for _i, _b in enumerate(_clean_loader):
+                if _i * config.batch_size >= 200:   # cap at ~200 samples
+                    break
+                _f = _b["frames"].to(device)
+                _o = model(_f)
+                _clean_probs.extend(_o.prob.cpu().tolist())
+                _clean_labels.extend(_b["label"].cpu().tolist())
+        _clean_probs  = np.array(_clean_probs)
+        _clean_labels = np.array(_clean_labels)
+        _clean_real_acc = float(((_clean_probs < 0.5) & (_clean_labels == 0)).sum() /
+                                max((_clean_labels == 0).sum(), 1))
+        _clean_fake_acc = float(((_clean_probs >= 0.5) & (_clean_labels == 1)).sum() /
+                                max((_clean_labels == 1).sum(), 1))
+        print(f"[sanity] epoch={epoch+1} train_clean: real_acc={_clean_real_acc:.3f} "
+              f"fake_acc={_clean_fake_acc:.3f}  "
+              f"(if real_acc is much lower than val real_acc, aug shortcut still live)")
+        model.train()
 
         # ── Checkpoint ────────────────────────────────────────────────────────
         val_auc = metrics.get("auc_roc", float("nan"))

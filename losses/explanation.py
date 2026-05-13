@@ -83,9 +83,13 @@ class ExplanationLoss(nn.Module):
         inter_sample_sim = float(
             sim_matrix.masked_fill(eye, 0.0).sum().item() / (n_pairs + 1e-8)
         )
-        l_div_tensor = F.relu(
-            sim_matrix.masked_fill(eye, 0.0).sum() / (n_pairs + 1e-8) - 0.5
-        )
+        # CHANGE 4 (phase7): no ReLU dead zone — diversity penalty is active at
+        # ALL similarity levels, not only above 0.5. mean_sim is in [-1, 1],
+        # clamp_min(0) keeps loss non-negative without zeroing gradients in
+        # the healthy regime. Without this, the system can drift from sim=0.3
+        # to sim=1.0 with zero penalty and no recovery signal.
+        mean_sim_tensor = sim_matrix.masked_fill(eye, 0.0).sum() / (n_pairs + 1e-8)
+        l_div_tensor = mean_sim_tensor.clamp_min(0.0)
         loss = loss + self.diversity_weight * l_div_tensor
 
         return ExplanationLossOutput(
