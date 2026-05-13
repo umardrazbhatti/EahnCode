@@ -67,7 +67,11 @@ class EAHN(nn.Module):
         )
 
         # ── Cross-Attention Fusion ────────────────────────────────────────────
-        self.cross_attention = CrossAttentionFusion(d_model=d, num_heads=config.transformer_heads)
+        self.cross_attention = CrossAttentionFusion(
+            d_model=d,
+            num_heads=config.transformer_heads,
+            attn_temp_init=getattr(config, "attn_temp_init", 0.0),
+        )
 
         # ── Classification Head ───────────────────────────────────────────────
         self.classifier = nn.Linear(d, 1)

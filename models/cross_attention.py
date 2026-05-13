@@ -16,16 +16,18 @@ import torch.nn.functional as F
 
 
 class CrossAttentionFusion(nn.Module):
-    def __init__(self, d_model: int = 256, num_heads: int = 8):
+    def __init__(self, d_model: int = 256, num_heads: int = 8,
+                 attn_temp_init: float = 0.0):
         super().__init__()
         self.d_model   = d_model
         self.num_heads = num_heads
         self.head_dim  = d_model // num_heads
         self.scale     = math.sqrt(self.head_dim)
 
-        # Learnable temperature: τ = exp(log_temp), initialised to 4.0.
-        # Higher τ sharpens the softmax distribution, breaking uniform collapse.
-        self.log_temp = nn.Parameter(torch.tensor(math.log(4.0)))
+        # Learnable temperature; τ = exp(log_temp). Phase 8 default: τ = 1.0
+        # (was hardcoded log(4.0)=1.386 → τ=4, which over-smoothed attention
+        # rows from initialization). τ can still grow during training.
+        self.log_temp = nn.Parameter(torch.tensor(float(attn_temp_init)))
 
         self.q_proj   = nn.Linear(d_model, d_model, bias=False)
         self.k_proj   = nn.Linear(d_model, d_model, bias=False)
@@ -52,29 +54,20 @@ class CrossAttentionFusion(nn.Module):
         scores = torch.bmm(Qp, Kp.transpose(-2, -1)) / (self.scale * tau)  # (B·T, L, L)
         A      = F.softmax(scores, dim=-1)  # softmax over key dimension
 
-        # Attended values (creates gradient path from classifier back to A)
-        attended = self.out_proj(torch.bmm(A, Vp))  # (B·T, L, d)
+        # Phase 8 CHANGE 1 (root-cause fix): M_flat is already a probability
+        # distribution — it is the column-mean of a row-stochastic matrix, so
+        # each entry lies in [0,1] and they sum to 1 per frame. The previous
+        # phase-7 code applied a SECOND softmax to this distribution, which
+        # exponentially compresses it toward the uniform centroid (1/L per cell)
+        # and structurally pins inter_sample_cosine above 0.95. Removing that
+        # softmax lets M_t carry real spatial signal.
+        M_flat = A.mean(dim=-2)                        # (B·T, L), already sums to 1
+        M_t    = M_flat.reshape(B, T, h, w)            # use directly, NO softmax
 
-        # Explanation map: mean over query positions → each key location's total weight
-        M_flat = A.mean(dim=-2)          # (B·T, L)
-        M_t    = M_flat.reshape(B, T, h, w)
-
-        # CHANGE 2 (phase7): softmax-only. The previous rescale-by-max divided
-        # a near-uniform softmax distribution by its own (near-uniform) max,
-        # mapping uniform attention to the constant 1.0 — destroying every
-        # spatial signal. Softmax outputs are already in [0,1] mathematically.
-        # Visualisation code does its own per-frame normalisation downstream.
-        M_t = M_t.reshape(B, T, h * w)
-        M_t = torch.softmax(M_t, dim=-1)       # spatial probability distribution
-        M_t = M_t.reshape(B, T, h, w)
-
-        # CHANGE 3 (phase7): use the softmax'd, normalised M_t as pool weights
-        # instead of pre-softmax M_flat (which is row-stochastic-and-uniform
-        # → degenerate flat mean). Now classifier gradient w.r.t. M_t is
-        # non-degenerate, and L_cls actually pressures attention to learn.
-        L_local = h * w
-        W = M_t.reshape(B * T, L_local, 1)             # (B·T, L, 1), sums to 1 per frame
-        S_pool    = (W * Vp).sum(dim=1)                # (B·T, d), true weighted pool
+        # attn_pool: use M_flat as weights (sums to 1 per frame → proper weighted pool).
+        # Classifier gradient now flows through learned M_flat → attention parameters.
+        W = M_flat.unsqueeze(-1)                       # (B·T, L, 1)
+        S_pool    = (W * Vp).sum(dim=1)                # (B·T, d)
         attn_pool = S_pool.reshape(B, T, d).mean(dim=1) # (B, d)
 
         return M_t, attn_pool

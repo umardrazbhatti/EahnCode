@@ -37,18 +37,18 @@ class EAHNConfig:
     # ── Loss weights ──────────────────────────────────────────────────────────
     lambda1: float = 0.3   # L_exp weight (reduced 0.5→0.3 phase7: L_exp no longer stuck at ~3.0, leave room for L_cls to dominate early)
     lambda2: float = 0.2   # L_temp weight (raised 0.1→0.2 phase6: loosen temporal grip)
-    alpha: float = 0.05    # entropy weight in weak supervision (reduced 0.2→0.05 phase6: break attention sparsity collapse)
+    alpha: float = 0.3     # entropy weight in weak supervision (raised 0.05→0.3 phase8: real sharpening pressure against the uniform fixed point)
     beta: float = 0.5      # TV weight in weak supervision
     gamma: float = 0.1     # gate decay rate in L_temp (was 10.0 — caused exp→0)
-    attn_temp_init: float = 1.386   # log(4.0) — learnable cross-attention temperature init
-    attn_diversity_weight: float = 3.0  # weight for attention diversity penalty in L_exp (lowered 6.0→3.0 phase7: ReLU dead zone removed, penalty now always active)
+    attn_temp_init: float = 0.0    # τ = exp(0) = 1.0 (was log(4.0)=1.386 → τ=4, over-smoothed attention from init; phase8)
+    attn_diversity_weight: float = 5.0  # weight for JS diversity penalty in L_exp (raised 3.0→5.0 phase8: JS has smaller scale than cosine)
     cls_dropout_p: float = 0.0    # phase7: disabled — attn_pool now informative; joint gradient on every step
-    label_smoothing: float = 0.05  # label smoothing for BCE/focal loss (phase6: 0→0.05)
+    label_smoothing: float = 0.0   # label smoothing for BCE/focal loss (removed phase8: uncap probability range; was 0.05)
     max_per_class: int = 0         # if > 0, subsample train set to this many samples per class
 
     # ── Classification loss ───────────────────────────────────────────────────
     cls_loss_type: str = "focal"   # "bce" | "focal"
-    focal_alpha: float = 0.25
+    focal_alpha: float = 1.0   # raised 0.25→1.0 phase8: remove gradient-magnitude shrinkage; WeightedRandomSampler handles balance
     focal_gamma: float = 1.0  # lowered 1.5→1.0 phase6: further de-saturate logits for real class
 
     # ── Training ──────────────────────────────────────────────────────────────

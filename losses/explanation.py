@@ -73,24 +73,45 @@ class ExplanationLoss(nn.Module):
 
         loss = loss / B
 
-        # Inter-sample diversity — penalise when different samples produce similar heatmaps.
-        # A one-hot map at the same location across all samples gives inter_sim ≈ 1.0.
-        flat = M_t.reshape(B * T, h * w)
-        flat = flat / (flat.norm(dim=-1, keepdim=True) + 1e-8)
-        sim_matrix = flat @ flat.T                              # (BT, BT)
-        eye = torch.eye(B * T, dtype=torch.bool, device=M_t.device)
-        n_pairs = B * T * (B * T - 1)
-        inter_sample_sim = float(
-            sim_matrix.masked_fill(eye, 0.0).sum().item() / (n_pairs + 1e-8)
-        )
-        # CHANGE 4 (phase7): no ReLU dead zone — diversity penalty is active at
-        # ALL similarity levels, not only above 0.5. mean_sim is in [-1, 1],
-        # clamp_min(0) keeps loss non-negative without zeroing gradients in
-        # the healthy regime. Without this, the system can drift from sim=0.3
-        # to sim=1.0 with zero penalty and no recovery signal.
-        mean_sim_tensor = sim_matrix.masked_fill(eye, 0.0).sum() / (n_pairs + 1e-8)
-        l_div_tensor = mean_sim_tensor.clamp_min(0.0)
+        # Inter-sample diversity — Jensen-Shannon divergence (phase8).
+        # Cosine on probability vectors has a high structural floor (~0.5+) on
+        # the simplex: two distributions sharing the uniform component 1/L
+        # cannot have cos < ~0.5 without becoming near-one-hot. JS divergence
+        # is the correct metric for distributional difference; its range is
+        # [0, log(2)], with 0 meaning identical and log(2) meaning disjoint.
+        import math as _math
+        N = B * T
+        eye = torch.eye(N, dtype=torch.bool, device=M_t.device)
+        n_pairs = N * (N - 1)
+
+        eps = 1e-8
+        P = M_t.reshape(N, h * w) + eps             # (N, L), smooth for log safety
+        P = P / P.sum(dim=-1, keepdim=True)          # renormalise to valid distributions
+
+        log_P = P.log()                              # (N, L)
+        P_i = P.unsqueeze(1)                         # (N, 1, L)
+        P_j = P.unsqueeze(0)                         # (1, N, L)
+        M_mix = 0.5 * (P_i + P_j)                   # (N, N, L)
+        log_M = M_mix.log()                          # (N, N, L)
+        log_P_i = log_P.unsqueeze(1)                 # (N, 1, L)
+        log_P_j = log_P.unsqueeze(0)                 # (1, N, L)
+        kl_im = (P_i * (log_P_i - log_M)).sum(dim=-1)  # (N, N)
+        kl_jm = (P_j * (log_P_j - log_M)).sum(dim=-1)  # (N, N)
+        js_matrix = 0.5 * (kl_im + kl_jm)           # (N, N), values in [0, log 2]
+
+        js_off = js_matrix.masked_fill(eye, 0.0)
+        mean_js_tensor = js_off.sum() / max(n_pairs, 1)
+        log2 = _math.log(2.0)
+        l_div_tensor = (log2 - mean_js_tensor).clamp_min(0.0)
         loss = loss + self.diversity_weight * l_div_tensor
+
+        # Cosine similarity kept as diagnostic for backward-compat with metric curves.
+        flat = M_t.reshape(N, h * w)
+        flat = flat / (flat.norm(dim=-1, keepdim=True) + 1e-8)
+        cos_matrix = flat @ flat.T
+        inter_sample_sim = float(
+            cos_matrix.masked_fill(eye, 0.0).sum().item() / (n_pairs + 1e-8)
+        )
 
         return ExplanationLossOutput(
             loss=loss,
