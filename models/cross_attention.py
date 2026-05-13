@@ -59,6 +59,17 @@ class CrossAttentionFusion(nn.Module):
         M_flat = A.mean(dim=-2)          # (B·T, L)
         M_t    = M_flat.reshape(B, T, h, w)
 
+        # ── CHANGE 8: softmax normalisation (replaces min-max) ────────────────
+        # Softmax turns M_t into a spatial probability distribution (sums to 1
+        # per frame), preventing min-max from amplifying noise in near-uniform
+        # maps into falsely sharp corner peaks (the 44% peak_mode_share bug).
+        M_t = M_t.reshape(B, T, h * w)
+        M_t = torch.softmax(M_t, dim=-1)    # per-frame probability distribution
+        M_t = M_t.reshape(B, T, h, w)
+        # Rescale to [0, 1] for visualisation compatibility
+        M_max = M_t.amax(dim=(-1, -2), keepdim=True).clamp_min(1e-8)
+        M_t   = M_t / M_max
+
         # Attention-weighted spatial pooling for classifier gradient path.
         # CRITICAL: grad(L_cls) → attn_pool → M_flat → A → Q, K projections → M_t
         M_weights = M_flat.unsqueeze(-1)                                      # (B·T, L, 1)

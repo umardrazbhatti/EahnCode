@@ -35,22 +35,24 @@ class EAHNConfig:
     dropout: float = 0.1
 
     # ── Loss weights ──────────────────────────────────────────────────────────
-    lambda1: float = 1.5   # L_exp weight (raised 1.0→1.5 phase5d: stronger explanation supervision)
-    lambda2: float = 0.1   # L_temp weight (was 0.5 — reduced to avoid freezing heatmaps)
-    alpha: float = 0.2     # entropy weight in weak supervision (was 0.5 — reduced to avoid one-hot collapse)
+    lambda1: float = 0.5   # L_exp weight (reduced 1.5→0.5 phase6: de-saturate logits)
+    lambda2: float = 0.2   # L_temp weight (raised 0.1→0.2 phase6: loosen temporal grip)
+    alpha: float = 0.05    # entropy weight in weak supervision (reduced 0.2→0.05 phase6: break attention sparsity collapse)
     beta: float = 0.5      # TV weight in weak supervision
     gamma: float = 0.1     # gate decay rate in L_temp (was 10.0 — caused exp→0)
     attn_temp_init: float = 1.386   # log(4.0) — learnable cross-attention temperature init
-    attn_diversity_weight: float = 4.0  # weight for attention diversity penalty in L_exp (raised 2.5→4.0 phase5d: prevent spatial mode collapse)
+    attn_diversity_weight: float = 6.0  # weight for attention diversity penalty in L_exp (raised 4.0→6.0 phase6: stronger anti-collapse pressure)
     # Phase 5c: lowered 0.3→0.1 while classifier is still learning.
     # Re-raise to 0.3 once val AUC-ROC > 0.7 to keep CLS_out from
     # free-riding the attention branch.
     cls_dropout_p: float = 0.1    # probability of dropping CLS_out to force gradient through attn branch
+    label_smoothing: float = 0.05  # label smoothing for BCE/focal loss (phase6: 0→0.05)
+    max_per_class: int = 0         # if > 0, subsample train set to this many samples per class
 
     # ── Classification loss ───────────────────────────────────────────────────
     cls_loss_type: str = "focal"   # "bce" | "focal"
     focal_alpha: float = 0.25
-    focal_gamma: float = 1.5  # lowered 2.0→1.5 phase5d: better gradient flow on real class in early epochs
+    focal_gamma: float = 1.0  # lowered 1.5→1.0 phase6: further de-saturate logits for real class
 
     # ── Training ──────────────────────────────────────────────────────────────
     epochs: int = 50
@@ -142,4 +144,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad_checkpoint", dest="grad_checkpoint", action="store_true", default=None)
     parser.add_argument("--no_grad_checkpoint", dest="grad_checkpoint", action="store_false")
     parser.add_argument("--clip_grad_norm", type=float, default=None)
+    parser.add_argument("--label_smoothing", type=float, default=None,
+                        help="Label smoothing applied to BCE/focal loss target (0.05 = maps 0→0.05, 1→0.95)")
+    parser.add_argument("--max_per_class", type=int, default=None,
+                        help="If > 0, subsample train set to this many samples per class (balanced 1k/1k)")
     return parser.parse_args()

@@ -51,6 +51,29 @@ def _get_fourcc() -> int:
     return _FOURCC
 
 
+# ── Top-K bounding box helper (CHANGE 10a) ───────────────────────────────────
+
+def _topk_bbox(heatmap: np.ndarray, percentile: int = 95):
+    """
+    Return (y0, x0, y1, x1) bounding box of pixels at or above the given
+    percentile of the heatmap.  Returns None if no pixels qualify.
+
+    Parameters
+    ----------
+    heatmap    : 2D numpy float array (any spatial size)
+    percentile : intensity percentile threshold (default 95 → top 5%)
+
+    Returns
+    -------
+    (y0, x0, y1, x1) int tuple, or None
+    """
+    thr = np.percentile(heatmap, percentile)
+    ys, xs = np.where(heatmap >= thr)
+    if len(ys) == 0:
+        return None
+    return (int(ys.min()), int(xs.min()), int(ys.max()), int(xs.max()))
+
+
 # ── overlay_heatmap_on_frame ──────────────────────────────────────────────────
 
 def overlay_heatmap_on_frame(
@@ -311,25 +334,64 @@ def save_annotated_frame_strip(
     n_select = min(T, 8)
     sel_idx  = np.linspace(0, T - 1, n_select, dtype=int)
 
-    annotated_frames = []
+    # ── Row 1: heatmap overlaid on frame + top-5% red bbox (CHANGE 10a) ───────
+    annotated_frames   = []
+    # ── Row 2: pure heatmap (no underlying frame)      (CHANGE 10b) ───────────
+    raw_heatmap_frames = []
+
     for idx in sel_idx:
-        frame   = cv2.resize(frames_bgr[idx], (224, 224))
-        overlay, _ = overlay_heatmap_on_frame(frame, attention_maps[idx])
-        label   = f"F{idx + 1:02d}  attn:{attention_scores[idx]:.2f}"
-        cv2.putText(
-            overlay, label, (4, 14),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1,
-        )
+        frame = cv2.resize(frames_bgr[idx], (224, 224))
+        overlay, attn_norm = overlay_heatmap_on_frame(frame, attention_maps[idx])
+
+        # Frame label
+        label = f"F{idx + 1:02d}  attn:{attention_scores[idx]:.2f}"
+        cv2.putText(overlay, label, (4, 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
+
+        # Top-5% bounding box in red (thin, on top of green contour from overlay)
+        bbox = _topk_bbox(attn_norm, percentile=95)
+        if bbox is not None:
+            y0, x0, y1, x1 = bbox
+            cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 0, 255), 1)
+
         annotated_frames.append(overlay)
 
-    strip   = np.hstack(annotated_frames)          # (224, n_select*224, 3)
-    strip_w = strip.shape[1]
+        # Pure heatmap tile
+        attn_r  = cv2.resize(attention_maps[idx].astype(np.float32), (224, 224))
+        a_min, a_max = attn_r.min(), attn_r.max()
+        attn_u8 = ((attn_r - a_min) / (a_max - a_min + 1e-8) * 255).astype(np.uint8)
+        raw_hm  = cv2.applyColorMap(attn_u8, cv2.COLORMAP_JET)
+        raw_heatmap_frames.append(raw_hm)
+
+    strip_row1 = np.hstack(annotated_frames)       # (224, n_select*224, 3)
+    strip_row2 = np.hstack(raw_heatmap_frames)     # (224, n_select*224, 3)
+    strip_w    = strip_row1.shape[1]
+
+    # ── Concentration stats for text panel (CHANGE 10c) ───────────────────────
+    if attention_maps:
+        all_peaks = [
+            np.unravel_index(np.argmax(m), m.shape) for m in attention_maps
+        ]
+        if all_peaks:
+            mode_loc       = max(set(all_peaks), key=all_peaks.count)
+            peak_mode_share = all_peaks.count(mode_loc) / len(all_peaks)
+        else:
+            peak_mode_share = 0.0
+        mean_std = float(np.mean([m.std() for m in attention_maps]))
+    else:
+        peak_mode_share = 0.0
+        mean_std        = 0.0
 
     # Build explanation text and render onto a dark PIL panel
     confidence = prob if prob >= 0.5 else (1.0 - prob)
     text       = generate_explanation_text(
         verdict, confidence, prob, attention_scores, attention_maps,
         batch_inter_sample_sim=batch_inter_sample_sim,
+    )
+    # Append concentration stats line
+    text += (
+        f"\nAttention concentration: "
+        f"peak_mode_share={peak_mode_share:.2f}, mt_std={mean_std:.4f}"
     )
     text_lines = text.split("\n")
     line_h     = 17
@@ -355,9 +417,9 @@ def save_annotated_frame_strip(
         color = verdict_color if i == 0 else other_color
         draw.text((left_margin, y), line, fill=color, font=font)
 
-    # Convert panel to BGR numpy and stack below the strip
+    # Convert panel to BGR numpy and stack: row1 (overlay) + row2 (raw heatmap) + text panel
     panel_bgr   = cv2.cvtColor(np.array(panel_pil), cv2.COLOR_RGB2BGR)
-    final_image = np.vstack([strip, panel_bgr])
+    final_image = np.vstack([strip_row1, strip_row2, panel_bgr])
 
     # Save image
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)

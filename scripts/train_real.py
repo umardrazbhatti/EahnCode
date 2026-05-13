@@ -1,26 +1,32 @@
 """
-scripts/train_real.py — Phase 2 GPU training on FF++/Celeb-DF/DFDC.
+scripts/train_real.py — Phase 6 GPU training on FF++/Celeb-DF/DFDC.
 
-Fixes vs original:
-  - autocast used correctly (no-op if not mixed precision / CPU)
-  - Scheduler (CosineAnnealingLR) wired in, as specified in the thesis
-  - grad_accum_steps respected
-  - eval_after_train uses run_evaluation from evaluate.py
+Phase 6 changes vs phase 5d:
+  - --max_per_class flag for balanced 1k/1k subsampling  (CHANGE 1)
+  - WeightedRandomSampler safety net rebuild              (CHANGE 2)
+  - 100-batch rolling log (not per-step)                 (CHANGE 3)
+  - Per-epoch attention-diversity diagnostic              (CHANGE 4)
+  - label_smoothing wired through build_classification_loss (CHANGE 6)
+  - loss_curves.png + metric_curves.png +
+    training_history.csv emitted at end of training       (CHANGE 12)
 """
 
 import os
+import csv as _csv
 import math
-import contextlib
 import torch
 import numpy as np
+from pathlib import Path
+from collections import defaultdict
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.amp import GradScaler, autocast
+import random
 
 from config import EAHNConfig, parse_args
 from data.datasets import DeepfakeDataset
 from data.collate import deepfake_collate_fn
 from models.eahn import EAHN
-from losses.classification import build_classification_loss, FocalLoss
+from losses.classification import build_classification_loss
 from losses.explanation import ExplanationLoss
 from losses.temporal import TemporalConsistencyLoss
 from metrics.detection import DetectionMetrics
@@ -48,28 +54,48 @@ def main(config: EAHNConfig):
     val_ds   = DeepfakeDataset(config, "val",   config.dataset_name)
     print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
 
-    labels_arr    = np.array([s["label"] for s in train_ds.samples], dtype=int)
-    class_counts  = np.bincount(labels_arr, minlength=2)
-    class_weights = 1.0 / np.maximum(class_counts, 1)
-    sample_weights = class_weights[labels_arr]
-    sampler = WeightedRandomSampler(
-        weights=torch.tensor(sample_weights, dtype=torch.double),
+    # ── CHANGE 1: optional per-class subsampling (balanced 1k/1k) ─────────────
+    max_per_class = int(getattr(config, "max_per_class", 0) or 0)
+    if max_per_class > 0:
+        random.seed(42)
+        buckets = defaultdict(list)
+        for s in train_ds.samples:
+            buckets[s["label"]].append(s)
+        new_samples = []
+        for lbl, lst in sorted(buckets.items()):
+            random.shuffle(lst)
+            kept = lst[:max_per_class]
+            new_samples.extend(kept)
+            print(f"[balance] class={lbl}: kept {len(kept)} of {len(lst)} samples")
+        random.shuffle(new_samples)
+        train_ds.samples = new_samples
+        print(f"[balance] train set is now {len(train_ds.samples)} samples total")
+
+    # ── CHANGE 2: WeightedRandomSampler safety net ────────────────────────────
+    train_labels  = [s["label"] for s in train_ds.samples]
+    class_counts  = np.bincount(train_labels, minlength=2)
+    print(f"[sampler] class counts: real={class_counts[0]}, fake={class_counts[1]}")
+    class_weights  = 1.0 / np.maximum(class_counts, 1)
+    sample_weights = [float(class_weights[l]) for l in train_labels]
+    train_sampler  = WeightedRandomSampler(
+        weights=sample_weights,
         num_samples=len(sample_weights),
         replacement=True,
     )
-    print(
-        f"[Sampler] class_counts={class_counts.tolist()} "
-        f"class_weights={class_weights.tolist()}"
-    )
     train_loader = DataLoader(
-        train_ds, batch_size=config.batch_size, sampler=sampler,
-        num_workers=config.num_workers, collate_fn=deepfake_collate_fn,
-        drop_last=True, pin_memory=(device.type == "cuda"),
+        train_ds,
+        batch_size=config.batch_size,
+        sampler=train_sampler,
+        num_workers=config.num_workers,
+        collate_fn=deepfake_collate_fn,
+        pin_memory=(config.device == "cuda"),
+        persistent_workers=(config.num_workers > 0),
+        drop_last=True,
     )
     val_loader = DataLoader(
         val_ds, batch_size=config.batch_size,
         num_workers=config.num_workers, collate_fn=deepfake_collate_fn,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=(config.device == "cuda"),
     )
 
     # ── First-batch class-balance smoke check ─────────────────────────────────
@@ -83,7 +109,7 @@ def main(config: EAHNConfig):
     )
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    model     = EAHN(config).to(device)
+    model = EAHN(config).to(device)
 
     if config.grad_checkpoint:
         model.enable_gradient_checkpointing()
@@ -103,11 +129,11 @@ def main(config: EAHNConfig):
         and torch.cuda.get_device_capability(device)[0] >= 7
     )
     _amp_dtype = torch.float16 if config.amp_dtype == "fp16" else torch.bfloat16
-    _dev_str   = device.type   # "cuda" or "cpu"
+    _dev_str   = device.type
     scaler     = GradScaler(_dev_str, enabled=_use_amp)
     print(f"[AMP] use_amp={_use_amp}  dtype={config.amp_dtype}")
 
-    logger  = Logger(config.output_dir)
+    logger = Logger(config.output_dir)
 
     # ── Resume ────────────────────────────────────────────────────────────────
     start_epoch = 0
@@ -119,31 +145,45 @@ def main(config: EAHNConfig):
         print(f"Resumed from epoch {start_epoch}, best AUC {best_auc:.4f}")
 
     # ── Losses ────────────────────────────────────────────────────────────────
-    if config.cls_loss_type == "focal":
-        cls_loss_fn = FocalLoss(
-            alpha=config.focal_alpha,
-            gamma=config.focal_gamma,
-        )
-        print(f"[ClsLoss] FocalLoss(alpha={config.focal_alpha}, gamma={config.focal_gamma})")
-    elif config.cls_loss_type == "bce":
-        cls_loss_fn = torch.nn.BCEWithLogitsLoss()
-        print("[ClsLoss] BCEWithLogitsLoss")
-    else:
-        raise ValueError(f"Unknown cls_loss_type: {config.cls_loss_type}")
-    exp_loss_fn  = ExplanationLoss(alpha=config.alpha, beta=config.beta, diversity_weight=config.attn_diversity_weight)
+    # CHANGE 6: label_smoothing read from config by build_classification_loss
+    cls_loss_fn = build_classification_loss(config)
+    print(
+        f"[ClsLoss] {cls_loss_fn.__class__.__name__}  "
+        f"label_smoothing={getattr(config, 'label_smoothing', 0.0)}"
+    )
+    exp_loss_fn  = ExplanationLoss(
+        alpha=config.alpha,
+        beta=config.beta,
+        diversity_weight=config.attn_diversity_weight,
+    )
     temp_loss_fn = TemporalConsistencyLoss(gamma=config.gamma)
 
     ckpt_path = os.path.join(config.output_dir, "best_model.pth")
 
+    # ── CHANGE 12a: epoch-level training history ───────────────────────────────
+    history = {
+        "epoch":               [],
+        "train_total":         [], "train_cls":  [],
+        "train_exp":           [], "train_temp": [],
+        "val_auc_roc":         [], "val_balanced_acc":      [],
+        "val_real_acc":        [], "val_fake_acc":          [],
+        "val_inter_sample_cos": [], "val_mt_std":           [],
+    }
+
     # ── Training loop ─────────────────────────────────────────────────────────
     total_batches = len(train_loader)
     epoch_w = len(str(config.epochs))
-    batch_w = len(str(total_batches))
 
     for epoch in range(start_epoch, config.epochs):
         model.train()
-        running_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
+
+        # ── CHANGE 12b: per-epoch loss accumulator ────────────────────────────
+        epoch_acc = {"total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0, "n": 0}
+
+        # ── CHANGE 3: 100-batch rolling log accumulator ───────────────────────
+        LOG_EVERY = 100
+        run = {"total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0, "n": 0}
 
         for batch_idx, batch in enumerate(train_loader):
             frames   = batch["frames"].to(device, non_blocking=True)
@@ -159,8 +199,8 @@ def main(config: EAHNConfig):
                 l_temp   = temp_loss_fn(out.M_t, out.low_level)
                 _global_step = epoch * len(train_loader) + batch_idx
                 _lambda1_eff = config.lambda1 * min(1.0, _global_step / 200.0)
-                l_total = l_cls + _lambda1_eff * l_exp + config.lambda2 * l_temp
-                loss    = l_total / config.grad_accum_steps
+                l_total  = l_cls + _lambda1_eff * l_exp + config.lambda2 * l_temp
+                loss     = l_total / config.grad_accum_steps
 
             scaler.scale(loss).backward()
 
@@ -171,43 +211,53 @@ def main(config: EAHNConfig):
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
 
+            # ── First-batch diagnostics (epoch 0 only) ────────────────────────
             if epoch == 0 and batch_idx == 0:
                 print(f"[DIAG] M_t mean={out.M_t.mean():.4f} std={out.M_t.std():.4f}")
-                print(f"[DIAG] L_cls={l_cls.item():.6f} L_exp={l_exp.item():.6f} L_temp={l_temp.item():.6f}")
-                print(f"[DIAG] attn_temp=exp({model.cross_attention.log_temp.item():.3f})={torch.exp(model.cross_attention.log_temp).item():.3f}")
+                print(f"[DIAG] L_cls={l_cls.item():.6f} L_exp={l_exp.item():.6f} "
+                      f"L_temp={l_temp.item():.6f}")
+                print(f"[DIAG] attn_temp=exp({model.cross_attention.log_temp.item():.3f})"
+                      f"={torch.exp(model.cross_attention.log_temp).item():.3f}")
 
-            if batch_idx % 20 == 0:
-                _live_std = out.M_t.std().item()
-                _live_tau = model.cross_attention.log_temp.exp().item()
-                print(
-                    f"[LIVE E{epoch+1} B{batch_idx:03d}] "
-                    f"M_t_std={_live_std:.3f}  "
-                    f"tau={_live_tau:.2f}  "
-                    f"L_cls={l_cls.item():.6f}  "
-                    f"L_H={exp_out.l_h:.6f}  "
-                    f"L_TV={exp_out.l_tv:.6f}  "
-                    f"L_div={exp_out.l_div:.6f}  "
-                    f"L_temp={l_temp.item():.6f}  "
-                    f"sample_sim={exp_out.inter_sample_sim:.2f}"
-                )
-
+            # ── Batch balance check every 50 steps ────────────────────────────
             if (batch_idx + 1) % 50 == 0:
                 bl = batch["label"].detach().cpu().numpy().astype(int)
                 n_real, n_fake = int((bl == 0).sum()), int((bl == 1).sum())
                 print(f"[BatchBalance] step={batch_idx+1} real={n_real} fake={n_fake}")
 
-            running_loss += l_total.item()
-            print(
-                f"Epoch {epoch + 1:>{epoch_w}}/{config.epochs} | "
-                f"Batch {batch_idx + 1:>{batch_w}}/{total_batches} | "
-                f"Loss: {l_total.item():.6f} | "
-                f"Cls: {l_cls.item():.6f} | "
-                f"Exp: {l_exp.item():.6f} | "
-                f"Temp: {l_temp.item():.6f} | "
-                f"sim: {exp_out.inter_sample_sim:.2f}"
-            )
+            # ── Accumulate losses ─────────────────────────────────────────────
+            _lt = l_total.item()
+            _lc = l_cls.item()
+            _le = l_exp.item()
+            _lp = l_temp.item()
+
+            run["total"] += _lt;  run["cls"] += _lc
+            run["exp"]   += _le;  run["temp"] += _lp;  run["n"] += 1
+
+            epoch_acc["total"] += _lt;  epoch_acc["cls"] += _lc
+            epoch_acc["exp"]   += _le;  epoch_acc["temp"] += _lp;  epoch_acc["n"] += 1
+
+            # ── CHANGE 3: rolling 100-batch log ───────────────────────────────
+            if (batch_idx + 1) % LOG_EVERY == 0 or (batch_idx + 1) == total_batches:
+                n = max(run["n"], 1)
+                _tau = model.cross_attention.log_temp.exp().item()
+                print(
+                    f"[E{epoch+1:>{epoch_w}} {batch_idx+1:4d}/{total_batches}] "
+                    f"total={run['total']/n:.4f}  cls={run['cls']/n:.4f}  "
+                    f"exp={run['exp']/n:.4f}  temp={run['temp']/n:.4f}  "
+                    f"tau={_tau:.2f}  sim={exp_out.inter_sample_sim:.2f}"
+                )
+                run = {"total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0, "n": 0}
 
         scheduler.step()
+
+        # ── CHANGE 12b cont.: store epoch-average train losses ─────────────────
+        n = max(epoch_acc["n"], 1)
+        history["epoch"].append(epoch)
+        history["train_total"].append(epoch_acc["total"] / n)
+        history["train_cls"].append(epoch_acc["cls"]   / n)
+        history["train_exp"].append(epoch_acc["exp"]   / n)
+        history["train_temp"].append(epoch_acc["temp"] / n)
 
         # ── Validation ────────────────────────────────────────────────────────
         model.eval()
@@ -227,9 +277,8 @@ def main(config: EAHNConfig):
             f"F1: {metrics['f1_at_0.5']:.4f}"
         )
 
-        # Per-class accuracy for diagnosing real/fake imbalance during training
-        _val_real_acc = float(metrics.get("real_accuracy", 0.0))
-        _val_fake_acc = float(metrics.get("fake_accuracy", 0.0))
+        _val_real_acc = float(metrics.get("real_accuracy",    0.0))
+        _val_fake_acc = float(metrics.get("fake_accuracy",    0.0))
         _val_bal_acc  = float(metrics.get("balanced_accuracy", 0.0))
         print(
             f"[ValMetrics] epoch={epoch + 1} "
@@ -238,7 +287,35 @@ def main(config: EAHNConfig):
             f"balanced_acc={_val_bal_acc:.3f}"
         )
 
-        # Save best
+        # ── CHANGE 4: attention-diversity diagnostic on first val batch ────────
+        with torch.no_grad():
+            diag_batch  = next(iter(val_loader))
+            diag_frames = diag_batch["frames"].to(device)
+            diag_out    = model(diag_frames)
+            mt          = diag_out.M_t.mean(dim=1)          # (B, h, w)
+            mt_flat     = mt.reshape(mt.size(0), -1)        # (B, hw)
+            mt_norm     = torch.nn.functional.normalize(mt_flat, dim=1)
+            cos_mat     = mt_norm @ mt_norm.t()
+            B_d         = cos_mat.size(0)
+            off_mask    = ~torch.eye(B_d, dtype=torch.bool, device=cos_mat.device)
+            off         = cos_mat[off_mask]
+            diag_cosine = float(off.mean()) if off.numel() > 0 else 0.0
+            diag_std    = float(mt_flat.std(dim=1).mean())
+        model.train()
+        print(
+            f"[Diag] epoch={epoch+1} "
+            f"inter_sample_cos={diag_cosine:.3f}  mt_std={diag_std:.4f}"
+        )
+
+        # ── CHANGE 12c: val metrics history ───────────────────────────────────
+        history["val_auc_roc"].append(float(metrics.get("auc_roc", float("nan"))))
+        history["val_balanced_acc"].append(_val_bal_acc)
+        history["val_real_acc"].append(_val_real_acc)
+        history["val_fake_acc"].append(_val_fake_acc)
+        history["val_inter_sample_cos"].append(diag_cosine)
+        history["val_mt_std"].append(diag_std)
+
+        # ── Checkpoint ────────────────────────────────────────────────────────
         val_auc = metrics.get("auc_roc", float("nan"))
         if not math.isnan(val_auc) and val_auc > best_auc:
             best_auc = val_auc
@@ -246,12 +323,76 @@ def main(config: EAHNConfig):
                             config, ckpt_path)
             print(f"--> Best model saved (AUC-ROC: {best_auc:.4f})")
 
-        # Always save a per-epoch fallback checkpoint
-        last_ckpt = os.path.join(config.output_dir, f"checkpoint_epoch{epoch:03d}.pth")
+        last_ckpt = os.path.join(
+            config.output_dir, f"checkpoint_epoch{epoch:03d}.pth"
+        )
         save_checkpoint(model, optimizer, scheduler, epoch, val_auc, config, last_ckpt)
 
     logger.close()
     print(f"\nTraining complete. Best AUC-ROC: {best_auc:.4f}")
+
+    # ── CHANGE 12d: end-of-run plots and CSV ──────────────────────────────────
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        out_path = Path(config.output_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+
+        # Save raw history to CSV
+        csv_hist = out_path / "training_history.csv"
+        with open(csv_hist, "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow(list(history.keys()))
+            w.writerows(zip(*history.values()))
+        print(f"[plot] saved {csv_hist}")
+
+        # Plot 1: training loss convergence (2x2)
+        fig, axes = plt.subplots(2, 2, figsize=(11, 7))
+        for ax, (key, title) in zip(axes.flat, [
+            ("train_total", "Total Loss"),
+            ("train_cls",   "Classification Loss"),
+            ("train_exp",   "Explanation Loss"),
+            ("train_temp",  "Temporal Consistency Loss"),
+        ]):
+            ax.plot(history["epoch"], history[key], marker="o", linewidth=2)
+            ax.set_title(title)
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel("Loss")
+            ax.grid(alpha=0.3)
+        fig.suptitle("EAHN — Training Loss Convergence", fontsize=13)
+        fig.tight_layout()
+        fig.savefig(out_path / "loss_curves.png", dpi=120)
+        plt.close(fig)
+        print(f"[plot] saved {out_path / 'loss_curves.png'}")
+
+        # Plot 2: validation metric trajectories (2x2)
+        fig, axes = plt.subplots(2, 2, figsize=(11, 7))
+        for ax, (keys, title) in zip(axes.flat, [
+            (["val_auc_roc"],                         "Val AUC-ROC"),
+            (["val_real_acc", "val_fake_acc"],        "Per-class Val Accuracy"),
+            (["val_balanced_acc"],                    "Val Balanced Accuracy"),
+            (["val_inter_sample_cos", "val_mt_std"],  "Attention Diversity"),
+        ]):
+            for k in keys:
+                ax.plot(history["epoch"], history[k],
+                        marker="o", linewidth=2, label=k)
+            if "AUC" in title or "Balanced" in title:
+                ax.axhline(0.5, color="grey", linestyle="--",
+                           alpha=0.5, label="random")
+            ax.set_title(title)
+            ax.set_xlabel("Epoch")
+            ax.grid(alpha=0.3)
+            ax.legend(fontsize=8)
+        fig.suptitle("EAHN — Validation Metric Trajectories", fontsize=13)
+        fig.tight_layout()
+        fig.savefig(out_path / "metric_curves.png", dpi=120)
+        plt.close(fig)
+        print(f"[plot] saved {out_path / 'metric_curves.png'}")
+
+    except Exception as _plot_err:
+        print(f"[plot] Warning: could not generate training plots: {_plot_err}")
 
     if config.eval_after_train:
         from scripts.evaluate import run_evaluation
