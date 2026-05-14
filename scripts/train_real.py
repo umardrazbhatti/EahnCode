@@ -147,13 +147,13 @@ def main(config: EAHNConfig):
     logger = Logger(config.output_dir)
 
     # ── Resume ────────────────────────────────────────────────────────────────
-    start_epoch = 0
-    best_auc    = -1.0
+    start_epoch  = 0
+    best_metric  = -1.0
     if config.resume_checkpoint and os.path.exists(config.resume_checkpoint):
         ckpt = load_checkpoint(config.resume_checkpoint, model, optimizer, scheduler)
-        start_epoch = ckpt.get("epoch", 0) + 1
-        best_auc    = ckpt.get("best_metric", 0.0)
-        print(f"Resumed from epoch {start_epoch}, best AUC {best_auc:.4f}")
+        start_epoch  = ckpt.get("epoch", 0) + 1
+        best_metric  = ckpt.get("best_metric", 0.0)
+        print(f"Resumed from epoch {start_epoch}, best metric {best_metric:.4f}")
 
     # ── Losses ────────────────────────────────────────────────────────────────
     # CHANGE 6: label_smoothing read from config by build_classification_loss
@@ -372,11 +372,18 @@ def main(config: EAHNConfig):
 
         # ── Checkpoint ────────────────────────────────────────────────────────
         val_auc = metrics.get("auc_roc", float("nan"))
-        if not math.isnan(val_auc) and val_auc > best_auc:
-            best_auc = val_auc
-            save_checkpoint(model, optimizer, scheduler, epoch, best_auc,
+        SELECTION_KEY = "balanced_accuracy_at_optimal"
+        sel = metrics.get(SELECTION_KEY)
+        if sel is None or not np.isfinite(sel):
+            print(f"[CheckpointSelect] {SELECTION_KEY} missing/NaN, falling back to auc_roc")
+            sel = metrics.get("auc_roc", 0.0)
+
+        if sel > best_metric:
+            best_metric = sel
+            save_checkpoint(model, optimizer, scheduler, epoch, best_metric,
                             config, ckpt_path)
-            print(f"--> Best model saved (AUC-ROC: {best_auc:.4f})")
+            print(f"--> Best model saved ({SELECTION_KEY}: {best_metric:.4f}, "
+                  f"val_auc_roc={metrics['auc_roc']:.4f})")
 
         last_ckpt = os.path.join(
             config.output_dir, f"checkpoint_epoch{epoch:03d}.pth"
@@ -384,7 +391,7 @@ def main(config: EAHNConfig):
         save_checkpoint(model, optimizer, scheduler, epoch, val_auc, config, last_ckpt)
 
     logger.close()
-    print(f"\nTraining complete. Best AUC-ROC: {best_auc:.4f}")
+    print(f"\nTraining complete. Best balanced_accuracy_at_optimal: {best_metric:.4f}")
 
     # ── CHANGE 12d: end-of-run plots and CSV ──────────────────────────────────
     try:

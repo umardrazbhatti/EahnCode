@@ -463,8 +463,11 @@ def save_explanation_video(
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
-    fourcc = _get_fourcc()
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     writer = cv2.VideoWriter(output_path, fourcc, fps, (224, 224 + 80))
+    if not writer.isOpened():
+        print(f"[WARN] VideoWriter failed to open for {output_path}; skipping")
+        return
 
     for t in range(T):
         frame   = cv2.resize(frames_bgr[t], (224, 224))

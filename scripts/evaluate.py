@@ -372,9 +372,12 @@ def run_evaluation(config: EAHNConfig):
     auc_roc   = float(det_metrics.get("auc_roc",   0.0))
     auc_pr    = float(det_metrics.get("auc_pr",    0.0))
     f1        = float(det_metrics.get("f1_at_0.5", 0.0))
-    acc       = float(det_metrics.get("accuracy",  0.0))
-    prec      = float(det_metrics.get("precision", 0.0))
-    rec       = float(det_metrics.get("recall",    0.0))
+    from sklearn.metrics import accuracy_score, precision_score, recall_score
+    _preds_at_05 = (np.array(all_probs) >= 0.5).astype(int)
+    _labels_arr  = np.array(all_labels)
+    acc  = float(accuracy_score(_labels_arr, _preds_at_05))
+    prec = float(precision_score(_labels_arr, _preds_at_05, zero_division=0))
+    rec  = float(recall_score(_labels_arr, _preds_at_05, zero_division=0))
     ins_auc   = float(del_ins.get("insertion_auc", 0.0))
     del_auc   = float(del_ins.get("deletion_auc",  0.0))
 
