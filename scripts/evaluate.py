@@ -480,9 +480,7 @@ def _generate_heatmaps(config, model, test_ds, sample_indices, device, all_probs
         video_path = sample["meta"].get("video_path", "")
         video_id   = os.path.splitext(os.path.basename(video_path))[0] if video_path else str(idx)
 
-        sampled_orig = _get_original_frames(
-            video_path, config.num_frames, config.frame_size,
-        )
+        sampled_orig = _denormalize_aligned_tensor_to_bgr(sample["frames"])
 
         with torch.no_grad():
             out = model(frames_tensor)
@@ -591,7 +589,7 @@ def _save_representative_heatmaps(
         )
         video_id = f"{role}_{video_id}"
 
-        orig_frames = _get_original_frames(video_path, config.num_frames, config.frame_size)
+        orig_frames = _denormalize_aligned_tensor_to_bgr(sample["frames"])
 
         with torch.no_grad():
             out = model(frames_tensor)
@@ -670,6 +668,24 @@ def _save_representative_heatmaps(
         print(f"[Representative] {role} → {video_id}  prob={prob:.3f}  verdict={verdict}")
 
     print(f"[Representative heatmaps] Saved {len(saved)} videos: {saved}")
+
+
+def _denormalize_aligned_tensor_to_bgr(frames_tensor) -> list:
+    """
+    Convert a face-aligned, ImageNet-normalized tensor (T, 3, H, W) float32
+    to a list of uint8 BGR numpy arrays (H, W, 3), one per frame.
+
+    This is the inverse of the torchvision Normalize(mean, std) transform
+    applied by DeepfakeDataset, so the underlay image matches exactly what
+    the model consumed — not the raw video frame.
+    """
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+
+    x = frames_tensor.detach().cpu().float()   # (T, 3, H, W)
+    x = (x * std + mean).clamp(0.0, 1.0) * 255.0
+    x = x.permute(0, 2, 3, 1).numpy().astype(np.uint8)  # (T, H, W, 3) RGB
+    return [frame[:, :, ::-1].copy() for frame in x]    # → BGR list
 
 
 def _get_original_frames(video_path: str, num_frames: int, frame_size: int):
