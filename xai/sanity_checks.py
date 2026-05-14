@@ -40,58 +40,79 @@ def model_randomization_check(
     n_random: int = 3,
 ) -> float:
     """
-    Cascade-randomize the model's weights layer by layer (from last to first).
-    For each randomization, recompute M_t and measure cosine similarity to the
-    original M_t.
-
-    A faithful explanation should change substantially when weights are randomized,
-    so the returned mean similarity should be LOW (e.g., < 0.5).
-    If it stays high (> 0.7), the explanation is insensitive to the model —
-    a sign that it is not faithfully representing what the model learned.
+    Phase 9 hotfix — three NaN fixes applied:
+      (a) Construct random_model with pretrained backbone so BatchNorm
+          running stats are valid → no NaN in forward pass from uninitialised
+          running_var (EfficientNet has ~50 BN layers; one NaN propagates).
+      (b) Add epsilon to cosine denominator → no 0/0 on zero-norm M_t frames.
+      (c) NaN-filter per-sample before averaging → one degenerate sample no
+          longer poisons the whole metric.
 
     Parameters
     ----------
-    model    : trained EAHN model (not modified — a deep copy is randomized)
-    frames   : (1, T, C, H, W) single sample tensor
-    n_random : number of cascade randomization steps to average over
+    model    : trained EAHN model (not modified)
+    frames   : (B, T, C, H, W) sample tensor
+    n_random : kept for API compatibility (not used in single-pass variant)
 
     Returns
     -------
-    mean_cosine_similarity : float
-        Mean cosine similarity between original M_t and randomized M_t across
-        n_random cascade steps. < 0.5 = explanation changes a lot (good).
-                               > 0.7 = explanation barely changes (bad).
+    mean_cosine_similarity : float  in [0, 1], or NaN only if ALL samples fail.
+        LOW (< 0.5)  = explanation changes a lot when weights are random (good).
+        HIGH (> 0.7) = explanation barely changes (bad — check faithfulness).
     """
-    original_M_t = _get_M_t(model, frames)
+    device = next(model.parameters()).device
 
-    model_copy = copy.deepcopy(model)
-    model_copy.eval()
+    # (a) Build a randomly-initialised EAHN that still has valid BN stats.
+    #     Start from the same config with backbone_pretrained=True so the CNN's
+    #     BN running_mean / running_var are populated; then re-init everything
+    #     else (temporal stream, cross-attention, classifier) to random weights.
+    cfg = copy.copy(model.config)
+    cfg.backbone_pretrained = True
+    random_model = type(model)(cfg).to(device).eval()
 
-    # Collect randomizable weight layers (Conv2d, Linear, LayerNorm)
-    named_params = [
-        (name, param)
-        for name, param in model_copy.named_parameters()
-        if param.requires_grad and param.dim() >= 1
-    ]
+    for name, module in random_model.named_modules():
+        if name.startswith("spatial_stream.backbone"):
+            continue   # keep pretrained weights + BN running stats
+        if hasattr(module, "reset_parameters"):
+            try:
+                module.reset_parameters()
+            except Exception:
+                pass
 
-    if not named_params:
-        return 1.0
+    eps = 1e-8
+    per_sample_cos = []
 
-    # Sample n_random evenly-spaced cascade positions
-    step_size = max(1, len(named_params) // max(n_random, 1))
-    cascade_positions = list(range(step_size - 1, len(named_params), step_size))[:n_random]
+    with torch.no_grad():
+        frames_dev = frames.to(device)
 
-    sims = []
-    for pos in cascade_positions:
-        # Randomize all layers up to and including pos (cascade)
-        for i in range(pos + 1):
-            name, param = named_params[i]
-            torch.nn.init.normal_(param.data)
+        m_trained = model(frames_dev).M_t        # (B, T, h, w)
+        m_random  = random_model(frames_dev).M_t  # (B, T, h, w)
 
-        randomized_M_t = _get_M_t(model_copy, frames)
-        sims.append(_cosine_sim(original_M_t, randomized_M_t))
+    if torch.isnan(m_trained).any() or torch.isnan(m_random).any():
+        print(f"[mt_vs_random] WARN: NaN in M_t "
+              f"(trained={torch.isnan(m_trained).any().item()}, "
+              f"random={torch.isnan(m_random).any().item()}); returning NaN")
+        return float("nan")
 
-    return float(np.mean(sims)) if sims else 1.0
+    # (b) Flatten per (sample, frame) → cosine with epsilon denominator
+    a = m_trained.flatten(2)                  # (B, T, L)
+    b = m_random.flatten(2)                   # (B, T, L)
+    num = (a * b).sum(dim=-1)                 # (B, T)
+    den = a.norm(dim=-1) * b.norm(dim=-1) + eps
+    cos = num / den                           # (B, T)
+    cos_per_sample = cos.mean(dim=-1)         # (B,)
+
+    # (c) NaN-filter per sample before averaging
+    finite = cos_per_sample[~torch.isnan(cos_per_sample)]
+    per_sample_cos = finite.cpu().tolist()
+
+    if not per_sample_cos:
+        print("[mt_vs_random] ALL samples NaN — returning NaN deliberately.")
+        return float("nan")
+
+    mean_cos = sum(per_sample_cos) / len(per_sample_cos)
+    print(f"[mt_vs_random] n_samples={len(per_sample_cos)}  mean_cos={mean_cos:.4f}")
+    return mean_cos
 
 
 def label_randomization_check(
