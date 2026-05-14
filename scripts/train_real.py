@@ -214,8 +214,8 @@ def main(config: EAHNConfig):
         # ── CHANGE 12b: per-epoch loss accumulator ────────────────────────────
         epoch_acc = {"total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0, "n": 0}
 
-        # ── CHANGE 3: 100-batch rolling log accumulator ───────────────────────
-        LOG_EVERY = 100
+        # ── CHANGE 3: rolling log accumulator ────────────────────────────────
+        LOG_EVERY = 200
         run = {"total": 0.0, "cls": 0.0, "exp": 0.0, "temp": 0.0, "n": 0}
 
         for batch_idx, batch in enumerate(train_loader):
@@ -252,8 +252,8 @@ def main(config: EAHNConfig):
                 print(f"[DIAG] attn_temp=exp({model.cross_attention.log_temp.item():.3f})"
                       f"={torch.exp(model.cross_attention.log_temp).item():.3f}")
 
-            # ── Batch balance check every 50 steps ────────────────────────────
-            if (batch_idx + 1) % 50 == 0:
+            # ── Batch balance check every LOG_EVERY steps ─────────────────────
+            if (batch_idx + 1) % LOG_EVERY == 0:
                 bl = batch["label"].detach().cpu().numpy().astype(int)
                 n_real, n_fake = int((bl == 0).sum()), int((bl == 1).sum())
                 print(f"[BatchBalance] step={batch_idx+1} real={n_real} fake={n_fake}")
@@ -270,7 +270,7 @@ def main(config: EAHNConfig):
             epoch_acc["total"] += _lt;  epoch_acc["cls"] += _lc
             epoch_acc["exp"]   += _le;  epoch_acc["temp"] += _lp;  epoch_acc["n"] += 1
 
-            # ── CHANGE 3: rolling 100-batch log ───────────────────────────────
+            # ── CHANGE 3: rolling log (every LOG_EVERY batches) ──────────────
             if (batch_idx + 1) % LOG_EVERY == 0 or (batch_idx + 1) == total_batches:
                 n = max(run["n"], 1)
                 _tau = model.cross_attention.log_temp.exp().item()
