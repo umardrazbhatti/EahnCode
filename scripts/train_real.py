@@ -17,10 +17,8 @@ import math
 import torch
 import numpy as np
 from pathlib import Path
-from collections import defaultdict
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader
 from torch.amp import GradScaler, autocast
-import random
 
 from config import EAHNConfig, parse_args
 from data.datasets import DeepfakeDataset
@@ -54,60 +52,32 @@ def main(config: EAHNConfig):
     val_ds   = DeepfakeDataset(config, "val",   config.dataset_name)
     print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
 
-    # ── CHANGE 1: optional per-class subsampling (balanced 1k/1k) ─────────────
-    max_per_class = int(getattr(config, "max_per_class", 0) or 0)
-    if max_per_class > 0:
-        random.seed(42)
-        buckets = defaultdict(list)
-        for s in train_ds.samples:
-            buckets[s["label"]].append(s)
-        new_samples = []
-        for lbl, lst in sorted(buckets.items()):
-            random.shuffle(lst)
-            kept = lst[:max_per_class]
-            new_samples.extend(kept)
-            print(f"[balance] class={lbl}: kept {len(kept)} of {len(lst)} samples")
-        random.shuffle(new_samples)
-        train_ds.samples = new_samples
-        print(f"[balance] train set is now {len(train_ds.samples)} samples total")
-        # CHANGE 1 (phase7): recompute imbalance gate on the BALANCED set,
-        # otherwise heavy augmentation is applied only to "real" samples and
-        # the model learns aug-pattern → label, not face → label.
-        _bal_labels = np.array([s["label"] for s in train_ds.samples], dtype=int)
-        _bal_counts = np.bincount(_bal_labels, minlength=2)
-        _bal_ratio  = _bal_counts.max() / max(_bal_counts.min(), 1)
-        train_ds.heavy_aug      = bool(_bal_ratio > 3.0)
-        train_ds.minority_class = int(_bal_counts.argmin())
-        print(f"[balance] post-resample: real={_bal_counts[0]} fake={_bal_counts[1]} "
-              f"ratio={_bal_ratio:.2f} heavy_aug={train_ds.heavy_aug} "
-              f"minority_class={train_ds.minority_class}")
-
-    # ── CHANGE 2: WeightedRandomSampler safety net ────────────────────────────
-    train_labels  = [s["label"] for s in train_ds.samples]
-    class_counts  = np.bincount(train_labels, minlength=2)
-    print(f"[sampler] class counts: real={class_counts[0]}, fake={class_counts[1]}")
-    class_weights  = 1.0 / np.maximum(class_counts, 1)
-    sample_weights = [float(class_weights[l]) for l in train_labels]
-    train_sampler  = WeightedRandomSampler(
-        weights=sample_weights,
-        num_samples=len(sample_weights),
-        replacement=True,
-    )
+    # ── DataLoader — Regime A: plain shuffle, no sampler ─────────────────────
+    # max_per_class cap is now applied inside DeepfakeDataset._build_ffpp()
+    # before the split, giving a true 1000:1000 balanced pool (200/type on the
+    # fake side). With balanced data the sampler is redundant and its asymmetric
+    # per-video exposure (real over-drawn, fake under-drawn) hurt convergence.
+    print("[Sampler] Mode=shuffled  (WeightedRandomSampler DISABLED for Regime A)")
     train_loader = DataLoader(
         train_ds,
         batch_size=config.batch_size,
-        sampler=train_sampler,
+        shuffle=True,
         num_workers=config.num_workers,
         collate_fn=deepfake_collate_fn,
         pin_memory=(config.device == "cuda"),
         persistent_workers=(config.num_workers > 0),
         drop_last=True,
     )
+    print(
+        f"[DataLoader] batch_size={config.batch_size}  shuffle=True  "
+        f"num_workers={config.num_workers}  drop_last=True"
+    )
     val_loader = DataLoader(
         val_ds, batch_size=config.batch_size,
         num_workers=config.num_workers, collate_fn=deepfake_collate_fn,
         pin_memory=(config.device == "cuda"),
     )
+    print(f"[DataLoader val] batch_size={config.batch_size}  shuffle=False  size={len(val_ds)}")
 
     # ── First-batch class-balance smoke check ─────────────────────────────────
     _sb = next(iter(train_loader))

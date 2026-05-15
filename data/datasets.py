@@ -26,6 +26,7 @@ Other dataset types:
 
 import os
 import json
+import random
 import warnings
 from pathlib import Path
 from typing import Literal
@@ -138,10 +139,21 @@ class DeepfakeDataset(Dataset):
         self.n_real = sum(1 for s in self.samples if s["label"] == 0)
         self.n_fake = sum(1 for s in self.samples if s["label"] == 1)
         _split_ratio = self.n_fake / max(self.n_real, 1)
+        from collections import Counter as _Counter
+        _fake_types = _Counter(
+            s["manipulation"] for s in self.samples if s["label"] == 1
+        )
+        _per_type = (
+            f"DF={_fake_types.get('Deepfakes', 0)} "
+            f"F2F={_fake_types.get('Face2Face', 0)} "
+            f"FShift={_fake_types.get('FaceShifter', 0)} "
+            f"FSwap={_fake_types.get('FaceSwap', 0)} "
+            f"NT={_fake_types.get('NeuralTextures', 0)}"
+        )
         print(
             f"[DeepfakeDataset | {dataset_type} / {mode}] "
             f"total={len(self.samples)}  real={self.n_real}  fake={self.n_fake}  "
-            f"ratio={_split_ratio:.1f}:1"
+            f"ratio={_split_ratio:.1f}:1 (per_fake_type: {_per_type})"
         )
 
     # ====================================================================
@@ -155,40 +167,76 @@ class DeepfakeDataset(Dataset):
         Relative to config.data_root (= .../ffpp_data/):
             Real: original_sequences/youtube/c23/videos/*.mp4
             Fake: manipulated_sequences/{Method}/c23/videos/*.mp4
+
+        When config.max_per_class > 0 (Regime A), the cap is applied per
+        binary class BEFORE the train/val/test split:
+            Real: up to max_per_class real videos (random, seed=42)
+            Fake: up to max_per_class // 5 per manipulation type (seed=42),
+                  remainder videos distributed in FF_METHODS order.
+        This guarantees type-balanced fake coverage in every split.
         """
         root      = Path(self.config.data_root)
         real_dir  = root / "original_sequences" / "youtube" / "c23" / "videos"
         fake_root = root / "manipulated_sequences"
 
-        real_videos = sorted(real_dir.glob("*.mp4"))
-        fake_videos: list[Path] = []
+        real_videos: list[Path] = list(sorted(real_dir.glob("*.mp4")))
+
+        # Build per-type fake video lists
+        fake_by_type: dict[str, list[Path]] = {}
         for method in FF_METHODS:
             d = fake_root / method / "c23" / "videos"
             if d.exists():
-                fake_videos.extend(sorted(d.glob("*.mp4")))
+                fake_by_type[method] = list(sorted(d.glob("*.mp4")))
             else:
                 warnings.warn(f"[FF++] Method directory not found: {d}")
+                fake_by_type[method] = []
 
         assert len(real_videos) > 0, (
             f"No real videos found at {real_dir}. "
             "Check config.data_root points to ffpp_data/."
         )
-        assert len(fake_videos) > 0, (
+        assert sum(len(v) for v in fake_by_type.values()) > 0, (
             f"No fake videos found under {fake_root}. "
             "Check that manipulated_sequences/ subdirectories exist."
         )
 
-        for v in real_videos:
-            self.samples.append(
-                {"video_path": str(v), "label": 0,
-                 "mask_path": None, "manipulation": "original"}
+        # Apply max_per_class cap per binary class, not per directory.
+        # Fake side distributes the budget evenly across the 5 types so that
+        # train/val/test splits all contain proportional type coverage.
+        max_n = int(getattr(self.config, "max_per_class", 0) or 0)
+        if max_n > 0:
+            _rng = random.Random(42)
+
+            # Real side: sample up to max_n
+            if len(real_videos) > max_n:
+                _rng.shuffle(real_videos)
+                real_videos = real_videos[:max_n]
+
+            # Fake side: max_n // 5 per type, remainder → first types in order
+            n_types   = len(FF_METHODS)
+            base_cap  = max_n // n_types
+            remainder = max_n % n_types
+            type_counts: dict[str, int] = {}
+            capped_fake: list[Path] = []
+            for j, method in enumerate(FF_METHODS):
+                cap_this = base_cap + (1 if j < remainder else 0)
+                vids = fake_by_type[method][:]
+                if len(vids) > cap_this:
+                    _rng.shuffle(vids)
+                    vids = vids[:cap_this]
+                capped_fake.extend(vids)
+                type_counts[method] = len(vids)
+
+            _type_str = " ".join(f"{m}={type_counts[m]}" for m in FF_METHODS)
+            print(
+                f"[MaxPerClass cap={max_n}] real={len(real_videos)} fake={len(capped_fake)} "
+                f"(per_type: {_type_str})"
             )
-        for v in fake_videos:
-            self.samples.append(
-                {"video_path": str(v), "label": 1,
-                 "mask_path": None,
-                 "manipulation": v.parent.parent.parent.name}
-            )
+            fake_videos_all: list[Path] = capped_fake
+        else:
+            fake_videos_all = []
+            for method in FF_METHODS:
+                fake_videos_all.extend(fake_by_type[method])
 
         # Mask detection — forward-compatible
         possible_mask_root = fake_root / "FaceSwap" / "c23" / "masks"
@@ -199,9 +247,21 @@ class DeepfakeDataset(Dataset):
             print("[FF++] No pixel-level masks → weakly-supervised L_exp (entropy+TV+diversity).")
 
         print(
-            f"[FF++ c23] real={len(real_videos)} fake={len(fake_videos)} "
-            f"total={len(self.samples)}"
+            f"[FF++ c23] real={len(real_videos)} fake={len(fake_videos_all)} "
+            f"total={len(real_videos) + len(fake_videos_all)}"
         )
+
+        for v in real_videos:
+            self.samples.append(
+                {"video_path": str(v), "label": 0,
+                 "mask_path": None, "manipulation": "original"}
+            )
+        for v in fake_videos_all:
+            self.samples.append(
+                {"video_path": str(v), "label": 1,
+                 "mask_path": None,
+                 "manipulation": v.parent.parent.parent.name}
+            )
 
     def _build_celeb_df(self):
         """Celeb-DF v2 is deferred to future work."""
@@ -280,24 +340,27 @@ class DeepfakeDataset(Dataset):
         """
         Stratified train/val/test split via sklearn.model_selection.train_test_split.
 
-        Stratification ensures both classes are present in every split.
-        A class-presence assertion fires at construction time (not at metric time)
-        so single-class splits are caught immediately.
+        Stratification key: "{label}_{manipulation}" — finer than binary label.
+        For FF++ this preserves per-type fake coverage in every split (Regime A).
+        For DFDC/synthetic it is equivalent to binary-label stratification.
+        A class-presence assertion fires at construction time so single-class
+        splits are caught immediately.
         """
         if len(samples) == 0:
             return []
 
-        labels = [s["label"] for s in samples]
+        # Composite key: "{label}_{manipulation}" gives per-type balance on FF++
+        # while remaining correct for DFDC ("1_dfdc") and synthetic ("1_synthetic").
+        strat_keys = [f"{s['label']}_{s['manipulation']}" for s in samples]
 
-        # Need at least 2 samples per class to stratify
+        # Need at least 2 samples per stratum to stratify
         from collections import Counter
-        label_counts = Counter(labels)
-        if min(label_counts.values()) < 2:
+        key_counts = Counter(strat_keys)
+        if min(key_counts.values()) < 2:
             warnings.warn(
-                f"[_split] Too few samples in minority class "
-                f"({label_counts}) — falling back to non-stratified split."
+                f"[_split] Too few samples in a stratum "
+                f"({key_counts}) — falling back to non-stratified split."
             )
-            import random
             data = samples[:]
             random.Random(0).shuffle(data)
             n = len(data)
@@ -312,12 +375,12 @@ class DeepfakeDataset(Dataset):
 
         test_frac = 1.0 - train_frac - val_frac
         train_val, test = train_test_split(
-            samples, test_size=test_frac, stratify=labels, random_state=42
+            samples, test_size=test_frac, stratify=strat_keys, random_state=42
         )
-        tv_labels = [s["label"] for s in train_val]
+        tv_keys      = [f"{s['label']}_{s['manipulation']}" for s in train_val]
         val_relative = val_frac / (train_frac + val_frac)
-        train, val = train_test_split(
-            train_val, test_size=val_relative, stratify=tv_labels, random_state=42
+        train, val   = train_test_split(
+            train_val, test_size=val_relative, stratify=tv_keys, random_state=42
         )
 
         # Class-presence assertion — catches broken splits at construction time
