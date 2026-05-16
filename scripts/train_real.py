@@ -58,6 +58,8 @@ def main(config: EAHNConfig):
     # fake side). With balanced data the sampler is redundant and its asymmetric
     # per-video exposure (real over-drawn, fake under-drawn) hurt convergence.
     print("[Sampler] Mode=shuffled  (WeightedRandomSampler DISABLED for Regime A)")
+    _train_generator = torch.Generator()
+    _train_generator.manual_seed(42)
     train_loader = DataLoader(
         train_ds,
         batch_size=config.batch_size,
@@ -67,10 +69,11 @@ def main(config: EAHNConfig):
         pin_memory=(config.device == "cuda"),
         persistent_workers=(config.num_workers > 0),
         drop_last=True,
+        generator=_train_generator,
     )
     print(
         f"[DataLoader] batch_size={config.batch_size}  shuffle=True  "
-        f"num_workers={config.num_workers}  drop_last=True"
+        f"num_workers={config.num_workers}  drop_last=True  generator=seed42"
     )
     val_loader = DataLoader(
         val_ds, batch_size=config.batch_size,
@@ -79,15 +82,30 @@ def main(config: EAHNConfig):
     )
     print(f"[DataLoader val] batch_size={config.batch_size}  shuffle=False  size={len(val_ds)}")
 
-    # ── First-batch class-balance smoke check ─────────────────────────────────
-    _sb = next(iter(train_loader))
-    _bl = _sb["label"].cpu().numpy().astype(int)
-    _n_real, _n_fake = int((_bl == 0).sum()), int((_bl == 1).sum())
-    print(f"[Smoke] First batch: real={_n_real} fake={_n_fake}")
-    assert _n_real > 0 and _n_fake > 0, (
-        f"First batch is single-class (real={_n_real}, fake={_n_fake}). "
-        "Sampler or split is broken — check DeepfakeDataset._split()."
+    # ── Multi-batch class-balance smoke check (Regime A) ──────────────────────
+    # Under balanced data + shuffle, a single-class first batch occurs ~12% of
+    # the time and is not a bug. Use a disposable side-loader (num_workers=0 so
+    # it doesn't compete with the training loader) and check 3 batches; only
+    # fail if ALL 3 are single-class, which is statistically near-impossible
+    # (~0.05%) and would always indicate a broken split.
+    _smoke_loader = DataLoader(
+        train_ds, batch_size=config.batch_size, shuffle=True,
+        collate_fn=deepfake_collate_fn, num_workers=0,
     )
+    _saw_real = _saw_fake = False
+    for _i, _sb in enumerate(iter(_smoke_loader)):
+        _bl = _sb["label"].cpu().numpy().astype(int)
+        _r, _f = int((_bl == 0).sum()), int((_bl == 1).sum())
+        print(f"[Smoke] Batch {_i}: real={_r} fake={_f}")
+        if _r > 0: _saw_real = True
+        if _f > 0: _saw_fake = True
+        if _i == 2: break
+    del _smoke_loader
+    assert _saw_real and _saw_fake, (
+        "All 3 inspected batches are single-class. Split or DataLoader broken — "
+        "check DeepfakeDataset._split()."
+    )
+    print("[Smoke] Both classes seen across 3 batches — Regime A loader OK.")
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model = EAHN(config).to(device)

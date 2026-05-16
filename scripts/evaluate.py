@@ -167,6 +167,7 @@ def run_evaluation(config: EAHNConfig):
         test_ds, batch_size=config.batch_size,
         num_workers=config.num_workers, collate_fn=deepfake_collate_fn,
     )
+    print(f"[DataLoader test] batch_size={config.batch_size}  shuffle=False  size={len(test_ds)}")
 
     # ── Detection pass ────────────────────────────────────────────────────────
     all_probs, all_labels = [], []
