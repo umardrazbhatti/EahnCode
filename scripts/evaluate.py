@@ -21,6 +21,7 @@ import csv
 import contextlib
 import torch
 import numpy as np
+from pathlib import Path as _PPath
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 
@@ -136,9 +137,33 @@ def save_detection_graphs(probs, labels, output_dir: str) -> None:
     print(f"[Evaluate] Detection graphs saved → {output_dir}")
 
 
+# ── Manipulation-type parser (Phase 15) ──────────────────────────────────────
+
+def parse_manipulation(video_path: str) -> str:
+    """
+    Infer manipulation type from FF++ video path.
+
+    Handles paths of the form:
+      .../manipulated_sequences/<TYPE>/c23/videos/XXX_YYY.mp4  → <TYPE>
+      .../original_sequences/youtube/c23/videos/ZZZ.mp4        → "real"
+      anything else (synthetic, unknown)                        → "unknown"
+
+    Expected return values:
+      {"Deepfakes", "Face2Face", "FaceShifter", "FaceSwap",
+       "NeuralTextures", "real", "unknown"}
+    """
+    parts = _PPath(video_path).parts
+    if "manipulated_sequences" in parts:
+        idx = parts.index("manipulated_sequences")
+        return parts[idx + 1]
+    elif "original_sequences" in parts:
+        return "real"
+    return "unknown"
+
+
 # ── Main evaluation entry point ───────────────────────────────────────────────
 
-def run_evaluation(config: EAHNConfig):
+def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
     device = torch.device(config.device)
 
     # ── Load model ────────────────────────────────────────────────────────────
@@ -441,6 +466,142 @@ def run_evaluation(config: EAHNConfig):
     print(f"[Evaluate] report.txt saved → {report_path}")
     print(report)
 
+    # ── Per-manipulation breakdown (Phase 15) ─────────────────────────────────
+    if breakdown_by_manipulation:
+        # Manipulation labels in DataLoader iteration order (shuffle=False → same as samples order)
+        _bd_manipulations = [parse_manipulation(s["video_path"]) for s in test_ds.samples]
+
+        # Per-sample peak (row, col) from mean M_t
+        _M_mean = all_M_t_up.mean(dim=1)           # (N, H, W)
+        _bd_peak_rows: list[int] = []
+        _bd_peak_cols: list[int] = []
+        for _i in range(len(_M_mean)):
+            _m    = _M_mean[_i].numpy()
+            _pidx = np.unravel_index(_m.argmax(), _m.shape)
+            _bd_peak_rows.append(int(_pidx[0]))
+            _bd_peak_cols.append(int(_pidx[1]))
+
+        _probs_np  = np.array(all_probs)
+        _labels_np = np.array(all_labels)
+        _real_mask = _labels_np == 0
+        _real_idxs = np.where(_real_mask)[0]
+
+        _FAKE_TYPES = ["Deepfakes", "Face2Face", "FaceShifter", "FaceSwap", "NeuralTextures"]
+        _bd_result: dict = {}
+
+        for _mtype in _FAKE_TYPES + ["real"]:
+            _idxs = [i for i, m in enumerate(_bd_manipulations) if m == _mtype]
+            _n    = len(_idxs)
+            if _n == 0:
+                continue
+
+            _probs_m = _probs_np[_idxs]
+            _pr_m    = [_bd_peak_rows[i] for i in _idxs]
+            _pc_m    = [_bd_peak_cols[i] for i in _idxs]
+
+            _entry: dict = {
+                "n":             _n,
+                "mean_prob":     float(np.mean(_probs_m)),
+                "peak_row_mean": float(np.mean(_pr_m)),
+                "peak_col_mean": float(np.mean(_pc_m)),
+                "peak_row_std":  float(np.std(_pr_m)),
+                "peak_col_std":  float(np.std(_pc_m)),
+            }
+
+            if _mtype != "real":
+                # AUC: this fake type paired with ALL real test samples
+                _comb_probs  = np.concatenate([_probs_np[_real_idxs], _probs_m])
+                _comb_labels = np.concatenate([np.zeros(len(_real_idxs)), np.ones(_n)])
+                if _n >= 5 and len(np.unique(_comb_labels)) >= 2:
+                    from sklearn.metrics import roc_auc_score as _roc_auc_bd
+                    try:
+                        _entry["auc_roc"] = float(_roc_auc_bd(_comb_labels, _comb_probs))
+                    except Exception as _e_bd:
+                        print(f"[Breakdown] AUC computation failed for {_mtype}: {_e_bd}")
+                        _entry["auc_roc"] = None
+                else:
+                    if _n < 5:
+                        print(f"[Breakdown] Skipping AUC for {_mtype}: n={_n} < 5 (threshold)")
+                    _entry["auc_roc"] = None
+                _entry["fake_acc_at_0.5"]     = float(np.mean(_probs_m >= 0.5))
+                _entry["fake_acc_at_optimal"] = float(np.mean(_probs_m >= opt_thr))
+            else:
+                _entry["real_acc_at_0.5"]     = float(np.mean(_probs_m < 0.5))
+                _entry["real_acc_at_optimal"] = float(np.mean(_probs_m < opt_thr))
+
+            _bd_result[_mtype] = _entry
+
+        # — Add to metrics.json —
+        metrics_json["breakdown_by_manipulation"] = _bd_result
+        with open(json_path, "w") as _jf:
+            _json.dump(metrics_json, _jf, indent=2)
+        print(f"[Evaluate] metrics.json updated with breakdown → {json_path}")
+
+        # — Append breakdown table to report.txt —
+        _bd_lines = [
+            "",
+            "─── Per-manipulation breakdown ───",
+            f"{'Type':<18} {'n':>5}  {'AUC':>6}  {'fake@0.5':>8}  {'fake@opt':>8}  peak(r,c)±std",
+        ]
+        for _mtype in _FAKE_TYPES:
+            if _mtype not in _bd_result:
+                continue
+            _e     = _bd_result[_mtype]
+            _auc_s = f"{_e['auc_roc']:.3f}" if _e.get("auc_roc") is not None else "   N/A"
+            _bd_lines.append(
+                f"{_mtype:<18} {_e['n']:>5}  {_auc_s:>6}  "
+                f"{_e['fake_acc_at_0.5']:>8.3f}  {_e['fake_acc_at_optimal']:>8.3f}  "
+                f"({_e['peak_row_mean']:.1f},{_e['peak_col_mean']:.1f})"
+                f"±({_e['peak_row_std']:.1f},{_e['peak_col_std']:.1f})"
+            )
+        if "real" in _bd_result:
+            _e = _bd_result["real"]
+            _bd_lines.append(
+                f"{'real':<18} {_e['n']:>5}  {'--':>6}  "
+                f"real@0.5={_e['real_acc_at_0.5']:.3f}  "
+                f"real@opt={_e['real_acc_at_optimal']:.3f}  "
+                f"({_e['peak_row_mean']:.1f},{_e['peak_col_mean']:.1f})"
+                f"±({_e['peak_row_std']:.1f},{_e['peak_col_std']:.1f})"
+            )
+        _bd_text = "\n".join(_bd_lines) + "\n"
+        with open(report_path, "a", encoding="utf-8") as _rf:
+            _rf.write(_bd_text)
+        print(f"[Evaluate] Per-manipulation breakdown appended to report.txt")
+        print(_bd_text)
+
+        # — Write CSV —
+        _csv_bd_path = os.path.join(eval_dir, "breakdown_by_manipulation.csv")
+        _csv_fields  = [
+            "type", "n", "auc_roc", "mean_prob",
+            "fake_acc_at_0.5", "fake_acc_at_optimal",
+            "real_acc_at_0.5", "real_acc_at_optimal",
+            "peak_row_mean", "peak_col_mean", "peak_row_std", "peak_col_std",
+        ]
+        _bd_rows = []
+        for _mtype in _FAKE_TYPES + ["real"]:
+            if _mtype not in _bd_result:
+                continue
+            _e = _bd_result[_mtype]
+            _bd_rows.append({
+                "type":                _mtype,
+                "n":                   _e["n"],
+                "auc_roc":             _e.get("auc_roc"),
+                "mean_prob":           _e.get("mean_prob"),
+                "fake_acc_at_0.5":     _e.get("fake_acc_at_0.5"),
+                "fake_acc_at_optimal": _e.get("fake_acc_at_optimal"),
+                "real_acc_at_0.5":     _e.get("real_acc_at_0.5"),
+                "real_acc_at_optimal": _e.get("real_acc_at_optimal"),
+                "peak_row_mean":       _e.get("peak_row_mean"),
+                "peak_col_mean":       _e.get("peak_col_mean"),
+                "peak_row_std":        _e.get("peak_row_std"),
+                "peak_col_std":        _e.get("peak_col_std"),
+            })
+        with open(_csv_bd_path, "w", newline="", encoding="utf-8") as _cf:
+            _csv_writer = csv.DictWriter(_cf, fieldnames=_csv_fields)
+            _csv_writer.writeheader()
+            _csv_writer.writerows(_bd_rows)
+        print(f"[Evaluate] Breakdown CSV → {_csv_bd_path}")
+
     # ── Heatmap generation ────────────────────────────────────────────────────
     if config.save_heatmaps:
         _generate_heatmaps(config, model, test_ds, indices[:5], device, all_probs,
@@ -712,3 +873,36 @@ def _get_original_frames(video_path: str, num_frames: int, frame_size: int):
     cap.release()
     blank = np.zeros((frame_size, frame_size, 3), np.uint8)
     return [buf.get(i, blank) for i in idxs]
+
+
+# ── CLI entry point ───────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse as _ap_main
+    import sys as _sys_main
+
+    # Parse evaluate-only flags first, before config's parse_args consumes sys.argv
+    _eval_parser = _ap_main.ArgumentParser(add_help=False)
+    _eval_parser.add_argument(
+        "--breakdown_by_manipulation",
+        action="store_true",
+        default=False,
+        help=(
+            "Segment test predictions by manipulation type (Deepfakes, Face2Face, "
+            "FaceShifter, FaceSwap, NeuralTextures, real). Computes per-type "
+            "AUC-ROC, fake/real accuracy at thr=0.5 and optimal threshold, and "
+            "mean peak (row, col) of M_t. Adds 'breakdown_by_manipulation' to "
+            "metrics.json, appends a table to report.txt, and writes "
+            "outputs/eval/breakdown_by_manipulation.csv."
+        ),
+    )
+    _eval_ns, _remaining_argv = _eval_parser.parse_known_args()
+
+    # Patch sys.argv so config.parse_args() sees only the standard flags
+    _sys_main.argv = [_sys_main.argv[0]] + _remaining_argv
+
+    from config import parse_args as _parse_config_args, EAHNConfig as _EAHNConfig
+    _args   = _parse_config_args()
+    _config = _EAHNConfig.from_args(_args)
+
+    run_evaluation(_config, breakdown_by_manipulation=_eval_ns.breakdown_by_manipulation)
