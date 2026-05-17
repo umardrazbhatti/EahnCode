@@ -13,6 +13,7 @@ Phase 6 changes vs phase 5d:
 
 import os
 import csv as _csv
+import dataclasses as _dataclasses
 import math
 import torch
 import numpy as np
@@ -135,13 +136,16 @@ def main(config: EAHNConfig):
     logger = Logger(config.output_dir)
 
     # ── Resume ────────────────────────────────────────────────────────────────
-    start_epoch  = 0
-    best_metric  = -1.0
+    start_epoch = 0
+    best_metric = -1.0
     if config.resume_checkpoint and os.path.exists(config.resume_checkpoint):
-        ckpt = load_checkpoint(config.resume_checkpoint, model, optimizer, scheduler)
-        start_epoch  = ckpt.get("epoch", 0) + 1
-        best_metric  = ckpt.get("best_metric", 0.0)
-        print(f"Resumed from epoch {start_epoch}, best metric {best_metric:.4f}")
+        ckpt        = load_checkpoint(config.resume_checkpoint, model, optimizer, scheduler)
+        start_epoch = ckpt.get("epoch", 0)      # already-completed epoch count (1-indexed)
+        best_metric = ckpt.get("best_metric", 0.0)
+        print(f"[Resume] Loaded {config.resume_checkpoint}, "
+              f"resuming from epoch {start_epoch + 1}  (best_metric={best_metric:.4f})")
+    elif config.resume_checkpoint:
+        print(f"[Resume] Checkpoint not found at {config.resume_checkpoint!r} — starting fresh.")
 
     # ── Losses ────────────────────────────────────────────────────────────────
     # CHANGE 6: label_smoothing read from config by build_classification_loss
@@ -193,9 +197,11 @@ def main(config: EAHNConfig):
 
     # ── Training loop ─────────────────────────────────────────────────────────
     total_batches = len(train_loader)
-    epoch_w = len(str(config.epochs))
+    epoch_w       = len(str(start_epoch + config.epochs))  # width for log padding
 
-    for epoch in range(start_epoch, config.epochs):
+    for epoch in range(start_epoch + 1, start_epoch + config.epochs + 1):
+        # epoch is 1-indexed: 1 = first ever epoch, 2 = second, etc.
+        # config.epochs is always the number of epochs in THIS session.
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
@@ -218,7 +224,7 @@ def main(config: EAHNConfig):
                 exp_out  = exp_loss_fn(out.M_t, masks, has_mask)
                 l_exp    = exp_out.loss
                 l_temp   = temp_loss_fn(out.M_t, out.low_level)
-                _global_step = epoch * len(train_loader) + batch_idx
+                _global_step = (epoch - 1) * len(train_loader) + batch_idx
                 _lambda1_eff = config.lambda1 * min(1.0, _global_step / 200.0)
                 l_total  = l_cls + _lambda1_eff * l_exp + config.lambda2 * l_temp
                 loss     = l_total / config.grad_accum_steps
@@ -232,8 +238,8 @@ def main(config: EAHNConfig):
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
 
-            # ── First-batch diagnostics (epoch 0 only) ────────────────────────
-            if epoch == 0 and batch_idx == 0:
+            # ── First-batch diagnostics (first epoch of this session only) ──────
+            if epoch == start_epoch + 1 and batch_idx == 0:
                 print(f"[DIAG] M_t mean={out.M_t.mean():.4f} std={out.M_t.std():.4f}")
                 print(f"[DIAG] L_cls={l_cls.item():.6f} L_exp={l_exp.item():.6f} "
                       f"L_temp={l_temp.item():.6f}")
@@ -263,7 +269,7 @@ def main(config: EAHNConfig):
                 n = max(run["n"], 1)
                 _tau = model.cross_attention.log_temp.exp().item()
                 print(
-                    f"[E{epoch+1:>{epoch_w}} {batch_idx+1:4d}/{total_batches}] "
+                    f"[E{epoch:>{epoch_w}} {batch_idx+1:4d}/{total_batches}] "
                     f"total={run['total']/n:.4f}  cls={run['cls']/n:.4f}  "
                     f"exp={run['exp']/n:.4f}  temp={run['temp']/n:.4f}  "
                     f"tau={_tau:.2f}  sim={exp_out.inter_sample_sim:.2f}"
@@ -274,7 +280,7 @@ def main(config: EAHNConfig):
 
         # ── CHANGE 12b cont.: store epoch-average train losses ─────────────────
         n = max(epoch_acc["n"], 1)
-        history["epoch"].append(epoch)
+        history["epoch"].append(epoch)   # 1-indexed epoch number
         history["train_total"].append(epoch_acc["total"] / n)
         history["train_cls"].append(epoch_acc["cls"]   / n)
         history["train_exp"].append(epoch_acc["exp"]   / n)
@@ -293,7 +299,7 @@ def main(config: EAHNConfig):
         metrics = DetectionMetrics.compute(probs_list, labels_list)
         logger.log_scalars("val", metrics, epoch)
         print(
-            f"Epoch {epoch + 1:>{epoch_w}}/{config.epochs} | "
+            f"Epoch {epoch:>{epoch_w}}/{start_epoch + config.epochs} | "
             f"Val AUC-ROC: {metrics['auc_roc']:.4f} | "
             f"F1: {metrics['f1_at_0.5']:.4f}"
         )
@@ -302,7 +308,7 @@ def main(config: EAHNConfig):
         _val_fake_acc = float(metrics.get("fake_accuracy",    0.0))
         _val_bal_acc  = float(metrics.get("balanced_accuracy", 0.0))
         print(
-            f"[ValMetrics] epoch={epoch + 1} "
+            f"[ValMetrics] epoch={epoch} "
             f"real_acc={_val_real_acc:.3f} "
             f"fake_acc={_val_fake_acc:.3f} "
             f"balanced_acc={_val_bal_acc:.3f}"
@@ -324,7 +330,7 @@ def main(config: EAHNConfig):
             diag_std    = float(mt_flat.std(dim=1).mean())
         model.train()
         print(
-            f"[Diag] epoch={epoch+1} "
+            f"[Diag] epoch={epoch} "
             f"inter_sample_cos={diag_cosine:.3f}  mt_std={diag_std:.4f}"
         )
 
@@ -353,7 +359,7 @@ def main(config: EAHNConfig):
                                 max((_clean_labels == 0).sum(), 1))
         _clean_fake_acc = float(((_clean_probs >= 0.5) & (_clean_labels == 1)).sum() /
                                 max((_clean_labels == 1).sum(), 1))
-        print(f"[sanity] epoch={epoch+1} train_clean: real_acc={_clean_real_acc:.3f} "
+        print(f"[sanity] epoch={epoch} train_clean: real_acc={_clean_real_acc:.3f} "
               f"fake_acc={_clean_fake_acc:.3f}  "
               f"(if real_acc is much lower than val real_acc, aug shortcut still live)")
         model.train()
@@ -373,10 +379,25 @@ def main(config: EAHNConfig):
             print(f"--> Best model saved ({SELECTION_KEY}: {best_metric:.4f}, "
                   f"val_auc_roc={metrics['auc_roc']:.4f})")
 
-        last_ckpt = os.path.join(
-            config.output_dir, f"checkpoint_epoch{epoch:03d}.pth"
+        # ── Always save last_checkpoint.pth (atomic, for multi-session resume) ──
+        # Written to a .tmp file first then os.replace() so a kernel kill
+        # mid-save never corrupts the checkpoint.
+        _last_path = os.path.join(config.output_dir, "last_checkpoint.pth")
+        _last_tmp  = _last_path + ".tmp"
+        torch.save(
+            {
+                "epoch":                epoch,           # 1-indexed, already completed
+                "model_state_dict":     model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "best_metric":          best_metric,
+                "config":               _dataclasses.asdict(config),
+            },
+            _last_tmp,
         )
-        save_checkpoint(model, optimizer, scheduler, epoch, val_auc, config, last_ckpt)
+        os.replace(_last_tmp, _last_path)
+        print(f"[Checkpoint] last_checkpoint.pth saved  "
+              f"(epoch={epoch}, best_metric={best_metric:.4f})")
 
     logger.close()
     print(f"\nTraining complete. Best balanced_accuracy_at_optimal: {best_metric:.4f}")

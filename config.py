@@ -66,6 +66,7 @@ class EAHNConfig:
 
     # ── Evaluation / Visualisation ────────────────────────────────────────────
     eval_after_train: bool = True
+    skip_eval: bool = False          # if True, suppress post-training evaluation entirely
     save_heatmaps: bool = True
     heatmap_samples: int = 20
 
@@ -145,4 +146,6 @@ def parse_args() -> argparse.Namespace:
                         help="Label smoothing applied to BCE/focal loss target (0.05 = maps 0→0.05, 1→0.95)")
     parser.add_argument("--max_per_class", type=int, default=None,
                         help="If > 0, subsample train set to this many samples per class (balanced 1k/1k)")
+    parser.add_argument("--skip_eval", action="store_true", default=False,
+                        help="If set, skip post-training evaluation (useful for mid-run Kaggle sessions)")
     return parser.parse_args()
