@@ -2,9 +2,14 @@
 scripts/verify_dataset.py — Pre-training dataset sanity check.
 
 Usage:
-    python scripts/verify_dataset.py --data_root /kaggle/input/.../ffpp_data
+    python scripts/verify_dataset.py \\
+        --data_root /kaggle/input/.../ffpp_data \\
+        --active_manipulation Deepfakes
 
 Exits with code 0 if all checks pass, code 1 if any check fails.
+
+Phase 17: specialist-only mode.  --active_manipulation is required because
+DeepfakeDataset now loads exactly one manipulation type.
 """
 
 import argparse
@@ -32,6 +37,10 @@ def main():
     parser = argparse.ArgumentParser(description="Verify FF++ dataset layout")
     parser.add_argument("--data_root", required=True,
                         help="Root directory of the FF++ dataset")
+    parser.add_argument("--active_manipulation", required=True,
+                        choices=["Deepfakes", "Face2Face", "FaceShifter",
+                                 "FaceSwap", "NeuralTextures"],
+                        help="Specialist manipulation type to verify (Phase 17).")
     args = parser.parse_args()
 
     data_root   = args.data_root
@@ -72,12 +81,13 @@ def main():
         from data.collate import deepfake_collate_fn
 
         config = EAHNConfig()
-        config.data_root   = data_root
-        config.frame_size  = 224
-        config.train_split = 0.8
-        config.val_split   = 0.1
-        config.cache_dir   = "/kaggle/working/.face_cache_verify"
-        config.device      = "cpu"
+        config.data_root            = data_root
+        config.active_manipulation  = args.active_manipulation
+        config.frame_size           = 224
+        config.train_split          = 0.8
+        config.val_split            = 0.1
+        config.cache_dir            = "/kaggle/working/.face_cache_verify"
+        config.device               = "cpu"
 
         ds = DeepfakeDataset(config, "train", "ff++")
 
@@ -113,8 +123,6 @@ def main():
         print(f"  Real in batch   : {n_real_in_batch}")
         print(f"  Fake in batch   : {n_fake_in_batch}")
         print(f"  Frames shape    : {tuple(batch['frames'].shape)}")
-        print(f"  Mask shape      : {tuple(batch['mask'].shape)}")
-        print(f"  has_mask        : {batch['has_mask'].tolist()}")
         if n_real_in_batch == 0 or n_fake_in_batch == 0:
             failures.append(
                 f"Batch is unbalanced: real={n_real_in_batch}, "
