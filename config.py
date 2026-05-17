@@ -153,7 +153,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_grad_checkpoint", dest="grad_checkpoint", action="store_false")
     parser.add_argument("--clip_grad_norm", type=float, default=None)
     parser.add_argument("--label_smoothing", type=float, default=None,
-                        help="Label smoothing applied to BCE/focal loss target (0.05 = maps 0→0.05, 1→0.95)")
+                        help="Label smoothing applied to BCE/focal loss target (0.05 = maps 0->0.05, 1->0.95)")
     parser.add_argument("--max_per_class", type=int, default=None,
                         help="If > 0, subsample train set to this many samples per class (balanced 1k/1k)")
     parser.add_argument("--skip_eval", action="store_true", default=False,
