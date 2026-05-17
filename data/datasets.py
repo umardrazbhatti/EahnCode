@@ -1,22 +1,17 @@
 """
 data/datasets.py  —  EAHN DeepfakeDataset
 ==========================================
-Locked to FF++ c23 custom-layout dataset.
+Locked to FF++ c23 specialist-only mode.
 
 Verified folder layout on Kaggle
 (umardrazbhatti/ffpp-c23-custom-layout/ffpp_data/):
 
   Real:  original_sequences/youtube/c23/videos/*.mp4          (1 000 videos, label=0)
-  Fake:  manipulated_sequences/{Method}/c23/videos/*.mp4      (1 000 per method × 5, label=1)
+  Fake:  manipulated_sequences/{Method}/c23/videos/*.mp4      (1 000 per method, label=1)
          Methods: Deepfakes, Face2Face, FaceShifter, FaceSwap, NeuralTextures
 
-No pixel-level manipulation masks exist in this snapshot → weakly-supervised
-L_exp (entropy + TV + inter-sample diversity) throughout.
-
-Class imbalance is handled at the DataLoader level via WeightedRandomSampler
-(see scripts/train_real.py).  heavy_aug is set automatically when the class
-ratio exceeds 3:1 — on FF++ c23 this triggers heavy augmentation for the 1 000
-real videos (the minority class).
+Specialist-only mode: config.active_manipulation selects a single manipulation
+type. Only that type's fake videos + real videos are loaded (1000 + 1000 = 1:1).
 
 Other dataset types:
   synthetic — generated in RAM for unit tests / smoke tests
@@ -71,8 +66,6 @@ class DeepfakeDataset(Dataset):
     Each __getitem__ returns a dict:
         frames    : Tensor (T, 3, H, W)  — normalised face-aligned frames
         label     : int                  — 0 = real, 1 = fake
-        mask      : Tensor (h, w)        — manipulation mask or zeros
-        has_mask  : bool                 — whether mask is a real GT mask
         meta      : dict                 — video_path, frame_indices
     """
 
@@ -86,7 +79,6 @@ class DeepfakeDataset(Dataset):
         self.mode         = mode
         self.dataset_type = dataset_type
         self.transform    = get_transforms(mode, config.frame_size)
-        self.has_masks: bool = False
         self.heavy_aug: bool = False
         self.minority_class: int = 1
         self.samples: list[dict] = []
@@ -162,106 +154,76 @@ class DeepfakeDataset(Dataset):
 
     def _build_ffpp(self):
         """
-        FF++ c23 custom-layout builder.
+        FF++ c23 specialist-only builder.
 
-        Relative to config.data_root (= .../ffpp_data/):
-            Real: original_sequences/youtube/c23/videos/*.mp4
-            Fake: manipulated_sequences/{Method}/c23/videos/*.mp4
-
-        When config.max_per_class > 0 (Regime A), the cap is applied per
-        binary class BEFORE the train/val/test split:
-            Real: up to max_per_class real videos (random, seed=42)
-            Fake: up to max_per_class // 5 per manipulation type (seed=42),
-                  remainder videos distributed in FF_METHODS order.
-        This guarantees type-balanced fake coverage in every split.
+        Loads ONLY config.active_manipulation fakes + real videos.
+        Forces 1000 real + 1000 fake (1:1) before split.
         """
         root      = Path(self.config.data_root)
         real_dir  = root / "original_sequences" / "youtube" / "c23" / "videos"
         fake_root = root / "manipulated_sequences"
 
-        real_videos: list[Path] = list(sorted(real_dir.glob("*.mp4")))
+        active = self.config.active_manipulation
+        if active not in {"Deepfakes", "Face2Face", "FaceShifter", "FaceSwap", "NeuralTextures"}:
+            raise ValueError(f"[FF++] Invalid active_manipulation: {active!r}")
 
-        # Build per-type fake video lists
-        fake_by_type: dict[str, list[Path]] = {}
-        for method in FF_METHODS:
-            d = fake_root / method / "c23" / "videos"
-            if d.exists():
-                fake_by_type[method] = list(sorted(d.glob("*.mp4")))
-            else:
-                warnings.warn(f"[FF++] Method directory not found: {d}")
-                fake_by_type[method] = []
+        real_videos: list[Path] = list(sorted(real_dir.glob("*.mp4")))
+        fake_dir = fake_root / active / "c23" / "videos"
+        if not fake_dir.exists():
+            raise FileNotFoundError(
+                f"[FF++] Active manipulation directory not found: {fake_dir}. "
+                f"Check that config.data_root points to ffpp_data/."
+            )
+        fake_videos: list[Path] = list(sorted(fake_dir.glob("*.mp4")))
 
         assert len(real_videos) > 0, (
             f"No real videos found at {real_dir}. "
             "Check config.data_root points to ffpp_data/."
         )
-        assert sum(len(v) for v in fake_by_type.values()) > 0, (
-            f"No fake videos found under {fake_root}. "
-            "Check that manipulated_sequences/ subdirectories exist."
+        assert len(fake_videos) > 0, (
+            f"No fake videos found at {fake_dir}."
         )
 
-        # Apply max_per_class cap per binary class, not per directory.
-        # Fake side distributes the budget evenly across the 5 types so that
-        # train/val/test splits all contain proportional type coverage.
-        max_n = int(getattr(self.config, "max_per_class", 0) or 0)
-        if max_n > 0:
-            _rng = random.Random(42)
+        # Force 1000 real + 1000 fake (1:1 balance for specialist training)
+        _rng = random.Random(42)
+        MAX_PER_CLASS = 1000
+        if len(real_videos) > MAX_PER_CLASS:
+            _rng_real = list(real_videos)
+            _rng.shuffle(_rng_real)
+            real_videos = _rng_real[:MAX_PER_CLASS]
+        if len(fake_videos) > MAX_PER_CLASS:
+            _rng_fake = list(fake_videos)
+            _rng.shuffle(_rng_fake)
+            fake_videos = _rng_fake[:MAX_PER_CLASS]
 
-            # Real side: sample up to max_n
-            if len(real_videos) > max_n:
-                _rng.shuffle(real_videos)
-                real_videos = real_videos[:max_n]
+        n_real = len(real_videos)
+        n_fake = len(fake_videos)
+        print(f"[Specialist] active={active} | discovered: real={n_real} fake={n_fake}")
 
-            # Fake side: max_n // 5 per type, remainder → first types in order
-            n_types   = len(FF_METHODS)
-            base_cap  = max_n // n_types
-            remainder = max_n % n_types
-            type_counts: dict[str, int] = {}
-            capped_fake: list[Path] = []
-            for j, method in enumerate(FF_METHODS):
-                cap_this = base_cap + (1 if j < remainder else 0)
-                vids = fake_by_type[method][:]
-                if len(vids) > cap_this:
-                    _rng.shuffle(vids)
-                    vids = vids[:cap_this]
-                capped_fake.extend(vids)
-                type_counts[method] = len(vids)
-
-            _type_str = " ".join(f"{m}={type_counts[m]}" for m in FF_METHODS)
-            print(
-                f"[MaxPerClass cap={max_n}] real={len(real_videos)} fake={len(capped_fake)} "
-                f"(per_type: {_type_str})"
-            )
-            fake_videos_all: list[Path] = capped_fake
-        else:
-            fake_videos_all = []
-            for method in FF_METHODS:
-                fake_videos_all.extend(fake_by_type[method])
-
-        # Mask detection — forward-compatible
-        possible_mask_root = fake_root / "FaceSwap" / "c23" / "masks"
-        self.has_masks = possible_mask_root.is_dir()
-        if self.has_masks:
-            print("[FF++] Pixel-level masks found → supervised L_exp will be used.")
-        else:
-            print("[FF++] No pixel-level masks → weakly-supervised L_exp (entropy+TV+diversity).")
-
+        # Estimate post-split sizes
+        n_total = n_real + n_fake
+        n_tr = round(n_total * self.config.train_split)
+        n_va = round(n_total * self.config.val_split)
+        n_te = n_total - n_tr - n_va
         print(
-            f"[FF++ c23] real={len(real_videos)} fake={len(fake_videos_all)} "
-            f"total={len(real_videos) + len(fake_videos_all)}"
+            f"[Specialist] active={active} | "
+            f"train≈{n_tr} ({n_tr//2}+{n_tr//2}) "
+            f"val≈{n_va} ({n_va//2}+{n_va//2}) "
+            f"test≈{n_te} ({n_te//2}+{n_te//2})"
         )
 
         for v in real_videos:
             self.samples.append(
-                {"video_path": str(v), "label": 0,
-                 "mask_path": None, "manipulation": "original"}
+                {"video_path": str(v), "label": 0, "manipulation": "original"}
             )
-        for v in fake_videos_all:
+        for v in fake_videos:
             self.samples.append(
-                {"video_path": str(v), "label": 1,
-                 "mask_path": None,
-                 "manipulation": v.parent.parent.parent.name}
+                {"video_path": str(v), "label": 1, "manipulation": active}
             )
+        print(
+            f"[FF++ c23 specialist] real={n_real} fake={n_fake} "
+            f"total={len(self.samples)}"
+        )
 
     def _build_celeb_df(self):
         """Celeb-DF v2 is deferred to future work."""
@@ -293,9 +255,8 @@ class DeepfakeDataset(Dataset):
                 label = 1 if info.get("label") == "FAKE" else 0
                 self.samples.append(
                     {"video_path": str(vpath), "label": label,
-                     "mask_path": None, "manipulation": "dfdc"}
+                     "manipulation": "dfdc"}
                 )
-        self.has_masks = False
         n_real = sum(1 for s in self.samples if s["label"] == 0)
         n_fake = sum(1 for s in self.samples if s["label"] == 1)
         print(
@@ -305,14 +266,13 @@ class DeepfakeDataset(Dataset):
 
     def _build_synthetic(self):
         """Synthetic data — generated entirely in RAM, no disk I/O."""
-        self.has_masks = True
         self.generator = SyntheticDataGenerator()
         n_total = 200  # 100 real + 100 fake
         for i in range(n_total):
             label = i % 2
             self.samples.append(
                 {"video_path": f"synthetic_{i}", "label": label,
-                 "mask_path": None, "manipulation": "synthetic"}
+                 "manipulation": "synthetic"}
             )
 
     # ====================================================================
@@ -417,18 +377,10 @@ class DeepfakeDataset(Dataset):
                 frame_size=(self.config.frame_size, self.config.frame_size),
                 seed=seed,
             )
-            h = w = self.config.frame_size // 32
-            mask_np = mask_full.numpy() if hasattr(mask_full, "numpy") else mask_full
-            mask_small = torch.tensor(
-                cv2.resize(mask_np.astype(np.float32), (w, h)),
-                dtype=torch.float32,
-            )
             return {
-                "frames":   frames,
-                "label":    label,
-                "mask":     mask_small,
-                "has_mask": True,
-                "meta":     {"video_path": sample["video_path"], "frame_indices": []},
+                "frames": frames,
+                "label":  label,
+                "meta":   {"video_path": sample["video_path"], "frame_indices": []},
             }
 
         # ── Real datasets: read from disk ────────────────────────────────
@@ -453,26 +405,9 @@ class DeepfakeDataset(Dataset):
             [aug(Image.fromarray(f)) for f in frames_np]
         )  # (T, 3, H, W)
 
-        # ── Mask ─────────────────────────────────────────────────────────
-        h = w = self.config.frame_size // 32  # 7 for 224px at stride 32
-        if (
-            self.has_masks
-            and sample.get("mask_path")
-            and os.path.exists(sample["mask_path"])
-        ):
-            mask_img = cv2.imread(sample["mask_path"], cv2.IMREAD_GRAYSCALE)
-            mask_img = cv2.resize(mask_img, (w, h)).astype(np.float32) / 255.0
-            mask     = torch.tensor(mask_img, dtype=torch.float32)
-            has_mask = True
-        else:
-            mask     = torch.zeros(h, w, dtype=torch.float32)
-            has_mask = False
-
         return {
-            "frames":   frames_tensor,
-            "label":    label,
-            "mask":     mask,
-            "has_mask": has_mask,
+            "frames": frames_tensor,
+            "label":  label,
             "meta": {
                 "video_path":    sample["video_path"],
                 "frame_indices": [],

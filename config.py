@@ -47,7 +47,7 @@ class EAHNConfig:
     max_per_class: int = 0         # if > 0, subsample train set to this many samples per class
 
     # ── Classification loss ───────────────────────────────────────────────────
-    cls_loss_type: str = "focal"   # "bce" | "focal"
+    cls_loss_type: str = "bce"   # "bce" | "focal"
     focal_alpha: float = 1.0   # raised 0.25→1.0 phase8: remove gradient-magnitude shrinkage; WeightedRandomSampler handles balance
     focal_gamma: float = 1.0  # lowered 1.5→1.0 phase6: further de-saturate logits for real class
 
@@ -67,6 +67,11 @@ class EAHNConfig:
     # ── Evaluation / Visualisation ────────────────────────────────────────────
     eval_after_train: bool = True
     skip_eval: bool = False          # if True, suppress post-training evaluation entirely
+    active_manipulation: str = ""           # REQUIRED at CLI; specialist-only mode
+    celebdf_root: str = ""                  # path to Celeb-DF v2 dataset root
+    celebdf_eval: bool = False              # run Celeb-DF test eval after FF++ test eval
+    save_last_checkpoint: bool = False      # Phase 16 leftover; OFF by default
+    explanation_suite: bool = True          # run new explanation metrics block after eval
     save_heatmaps: bool = True
     heatmap_samples: int = 20
 
@@ -100,6 +105,11 @@ class EAHNConfig:
         for key, val in vars(args).items():
             if hasattr(cfg, key) and val is not None:
                 setattr(cfg, key, val)
+        if not cfg.active_manipulation:
+            raise ValueError(
+                "--active_manipulation is required (specialist-only mode). "
+                "Pass one of: Deepfakes, Face2Face, FaceShifter, FaceSwap, NeuralTextures"
+            )
         return cfg
 
 
@@ -148,4 +158,19 @@ def parse_args() -> argparse.Namespace:
                         help="If > 0, subsample train set to this many samples per class (balanced 1k/1k)")
     parser.add_argument("--skip_eval", action="store_true", default=False,
                         help="If set, skip post-training evaluation (useful for mid-run Kaggle sessions)")
+    parser.add_argument("--active_manipulation", type=str, default=None,
+                        choices=["Deepfakes", "Face2Face", "FaceShifter",
+                                 "FaceSwap", "NeuralTextures"],
+                        help="Required: specialist manipulation type to train on.")
+    parser.add_argument("--celebdf_root", type=str, default=None,
+                        help="Path to Celeb-DF v2 dataset root.")
+    parser.add_argument("--celebdf_eval", action="store_true", default=None,
+                        help="Run Celeb-DF v2 test evaluation after FF++ test eval.")
+    parser.add_argument("--save_last_checkpoint", action="store_true", default=None,
+                        help="Save last_checkpoint.pth after every epoch (for multi-session resume).")
+    parser.add_argument("--explanation_suite", dest="explanation_suite",
+                        action="store_true", default=None,
+                        help="Run explanation metrics suite after evaluation.")
+    parser.add_argument("--no_explanation_suite", dest="explanation_suite",
+                        action="store_false")
     return parser.parse_args()

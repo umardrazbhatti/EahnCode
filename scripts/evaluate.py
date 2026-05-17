@@ -196,8 +196,7 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
 
     # ── Detection pass ────────────────────────────────────────────────────────
     all_probs, all_labels = [], []
-    all_M_t_up, all_masks = [], []
-    all_has_mask_flags    = []
+    all_M_t_up = []
 
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Evaluating detection"):
@@ -206,11 +205,8 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
             all_probs.extend(out.prob.cpu().tolist())
             all_labels.extend(batch["label"].cpu().tolist())
             all_M_t_up.append(out.M_t_up.cpu())
-            all_masks.append(batch["mask"].cpu())
-            all_has_mask_flags.extend(batch["has_mask"].cpu().tolist())
 
     all_M_t_up = torch.cat(all_M_t_up, dim=0)   # (N_test, T, H, W)
-    all_masks  = torch.cat(all_masks,  dim=0)   # (N_test, 7, 7)
 
     det_metrics = DetectionMetrics.compute(all_probs, all_labels)
     print("Detection Metrics:", det_metrics)
@@ -265,14 +261,6 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
     subset_size = min(config.heatmap_samples, len(test_ds))
     rng     = np.random.default_rng(42)
     indices = rng.choice(len(test_ds), subset_size, replace=False)
-
-    # Localisation IoU — only for samples that have ground-truth masks (5e)
-    M_sub_avg = all_M_t_up[indices].mean(dim=1)             # (subset, H, W)
-    masks_sub = all_masks[indices]                          # (subset, h, w)
-    hm_flags  = [all_has_mask_flags[int(i)] for i in indices]
-    avg_iou   = ExplanationMetrics.localisation_iou(
-        M_sub_avg, masks_sub, hm_flags, threshold=0.5
-    )   # float or None
 
     # Temporal SSIM
     ssim_val = ExplanationMetrics.temporal_ssim(all_M_t_up[indices])
@@ -357,10 +345,7 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
     except Exception as e:
         print(f"  [Adebayo sanity check skipped: {e}]")
 
-    # Use a string so metrics.csv shows "N/A" rather than NaN
-    avg_iou_display = f"{avg_iou:.4f}" if avg_iou is not None else "N/A"
     exp_metrics = {
-        "avg_iou":                    avg_iou_display,
         "temporal_ssim":              ssim_val,
         "faithfulness_corr":          faithful_corr,
         "mt_vs_random_model_cosine":  mt_vs_random_cosine,
@@ -433,6 +418,7 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
         "insertion_auc": ins_auc,
         "deletion_auc": del_auc,
     }
+    metrics_json["active_manipulation"] = getattr(config, "active_manipulation", "")
     json_path = os.path.join(eval_dir, "metrics.json")
     with open(json_path, "w") as f:
         _json.dump(metrics_json, f, indent=2)
@@ -601,6 +587,56 @@ def run_evaluation(config: EAHNConfig, breakdown_by_manipulation: bool = False):
             _csv_writer.writeheader()
             _csv_writer.writerows(_bd_rows)
         print(f"[Evaluate] Breakdown CSV → {_csv_bd_path}")
+
+    # ── Celeb-DF v2 test evaluation ──────────────────────────────────────────
+    if getattr(config, "celebdf_eval", False) and getattr(config, "celebdf_root", ""):
+        try:
+            print(f"\n[Celeb-DF] Loading test split from {config.celebdf_root} ...")
+            from data.celebdf_dataset import CelebDFv2TestDataset
+            from data.transforms import get_transforms as _get_transforms
+            _val_transform = _get_transforms("val", config.frame_size)
+            celebdf_test = CelebDFv2TestDataset(
+                root=config.celebdf_root,
+                num_frames=config.num_frames,
+                frame_size=config.frame_size,
+                face_aligner=test_ds.face_aligner,   # reuse existing aligner
+                transform=_val_transform,
+                cache_dir=getattr(config, "cache_dir", None),
+            )
+            celebdf_loader = DataLoader(
+                celebdf_test, batch_size=config.batch_size, shuffle=False,
+                num_workers=config.num_workers, collate_fn=deepfake_collate_fn,
+            )
+            # Run detection pass
+            _cdf_probs, _cdf_labels = [], []
+            with torch.no_grad():
+                for _cdf_batch in tqdm(celebdf_loader, desc="Celeb-DF eval"):
+                    _cdf_frames = _cdf_batch["frames"].to(device)
+                    _cdf_out    = model(_cdf_frames)
+                    _cdf_probs.extend(_cdf_out.prob.cpu().tolist())
+                    _cdf_labels.extend(_cdf_batch["label"].cpu().tolist())
+            celebdf_metrics = DetectionMetrics.compute(_cdf_probs, _cdf_labels)
+            celebdf_metrics["active_manipulation_trained_on"] = getattr(config, "active_manipulation", "")
+            celebdf_json_path = os.path.join(eval_dir, "celebdf_test_metrics.json")
+            with open(celebdf_json_path, "w") as _cdf_f:
+                _json.dump(celebdf_metrics, _cdf_f, indent=2)
+            print(f"[Celeb-DF] AUC-ROC={celebdf_metrics.get('auc_roc', 0):.4f} "
+                  f"F1={celebdf_metrics.get('f1_at_0.5', 0):.4f}")
+            print(f"[Celeb-DF] metrics saved → {celebdf_json_path}")
+        except Exception as _cdf_err:
+            print(f"[Celeb-DF] eval skipped: {_cdf_err}")
+
+    # ── Explanation suite ────────────────────────────────────────────────────
+    if getattr(config, "explanation_suite", True):
+        try:
+            from scripts.run_explanation_suite import run_explanation_suite
+            from scripts.save_xai_overlays import save_xai_overlays
+            _exp_out_path = _PPath(config.output_dir) / "explanation_metrics.json"
+            run_explanation_suite(model, test_loader, config, _exp_out_path)
+            _overlay_dir = _PPath(config.output_dir) / "plots" / "heatmaps"
+            save_xai_overlays(model, test_loader, config, _overlay_dir)
+        except Exception as _suite_err:
+            print(f"[ExplanationSuite] skipped: {_suite_err}")
 
     # ── Heatmap generation ────────────────────────────────────────────────────
     if config.save_heatmaps:

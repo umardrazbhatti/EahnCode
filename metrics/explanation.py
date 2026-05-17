@@ -16,53 +16,6 @@ from typing import Dict
 class ExplanationMetrics:
 
     @staticmethod
-    def localisation_iou(
-        M_t_avg: torch.Tensor,       # (B, H, W) or (H, W) — time-averaged maps
-        gt_masks: torch.Tensor,      # (B, h, w) or (h, w) — ground-truth masks
-        has_mask_flags,              # list[bool] or BoolTensor of length B
-        threshold: float = 0.5,
-    ):
-        """
-        Intersection-over-Union between binarised explanations and GT masks.
-
-        Only samples where has_mask_flags[i] is True are included.
-        Returns the mean IoU over valid samples, or None if no valid samples exist.
-        """
-        import torch.nn.functional as F
-
-        # Normalise to batch form
-        if M_t_avg.dim() == 2:
-            M_t_avg   = M_t_avg.unsqueeze(0)
-            gt_masks  = gt_masks.unsqueeze(0)
-            has_mask_flags = [has_mask_flags] \
-                if not hasattr(has_mask_flags, "__len__") else list(has_mask_flags)
-
-        B = M_t_avg.shape[0]
-        valid_ious = []
-
-        for i in range(B):
-            if not bool(has_mask_flags[i]):
-                continue
-            gt = gt_masks[i]
-            if gt.sum() == 0:
-                continue
-            m = M_t_avg[i]
-            if gt.shape != m.shape:
-                gt = F.interpolate(
-                    gt.unsqueeze(0).unsqueeze(0).float(),
-                    size=m.shape, mode="bilinear", align_corners=False,
-                ).squeeze()
-            M_bin = (m > threshold).float()
-            gt_f  = gt.float()
-            inter = (M_bin * gt_f).sum()
-            union = ((M_bin + gt_f) > 0).float().sum()
-            valid_ious.append(float(inter / (union + 1e-8)))
-
-        if len(valid_ious) == 0:
-            return None
-        return float(np.mean(valid_ious))
-
-    @staticmethod
     def temporal_ssim(M_t_up: torch.Tensor) -> float:
         """
         Mean SSIM between consecutive explanation frames.
@@ -192,4 +145,123 @@ class ExplanationMetrics:
             "peak_mode_share":          peak_mode_share,
             "m_t_std_mean":             m_t_std_mean,
             "m_t_std_max":              m_t_std_max,
+        }
+
+    @staticmethod
+    def frame_attention_drop_test(
+        model, loader, device, k_values=(1, 2, 4), seed: int = 42
+    ) -> dict:
+        """
+        Intrinsic faithfulness test.
+
+        For each video in the loader:
+        1. Forward pass (eval, no_grad) → get M_t (B, T, h, w).
+        2. Per-frame attention score = M_t[b, t, :, :].mean() over (h, w).
+        3. Rank frames by score (descending).
+        4. For each K in k_values:
+           a. Zero out top-K frames (at normalised input level) → re-forward → record prob.
+           b. Zero out K random frames (seeded) → re-forward → record prob.
+        5. Aggregate: conf_drop = original_prob - masked_prob.
+
+        Returns dict with keys:
+            k{K}_top_conf_drop, k{K}_random_conf_drop, k{K}_ratio  for each K.
+        A faithful explanation shows top_conf_drop >> random_conf_drop.
+        """
+        import numpy as np
+
+        model.eval()
+        rng = np.random.default_rng(seed)
+
+        accum = {k: {"top": [], "rand": []} for k in k_values}
+
+        with torch.no_grad():
+            for batch in loader:
+                frames = batch["frames"].to(device)          # (B, T, C, H, W)
+                B, T, C, H, W = frames.shape
+
+                out     = model(frames)
+                orig_p  = out.prob.cpu()                      # (B,)
+                M_t     = out.M_t.cpu()                       # (B, T, h, w)
+
+                # Per-frame attention score = spatial mean of M_t
+                frame_scores = M_t.mean(dim=(-1, -2))         # (B, T)
+
+                for b in range(B):
+                    scores_b  = frame_scores[b].numpy()        # (T,)
+                    ranked    = np.argsort(scores_b)[::-1]     # desc
+                    orig_prob = float(orig_p[b])
+
+                    for k in k_values:
+                        k = min(k, T)
+
+                        # — Top-K drop —
+                        top_k_idx = ranked[:k]
+                        f_top     = frames[b:b+1].clone()      # (1, T, C, H, W)
+                        f_top[0, top_k_idx] = 0.0
+                        drop_top  = orig_prob - float(model(f_top.to(device)).prob.cpu())
+
+                        # — Random-K drop —
+                        rand_k_idx = rng.choice(T, size=k, replace=False)
+                        f_rand     = frames[b:b+1].clone()
+                        f_rand[0, rand_k_idx] = 0.0
+                        drop_rand  = orig_prob - float(model(f_rand.to(device)).prob.cpu())
+
+                        accum[k]["top"].append(drop_top)
+                        accum[k]["rand"].append(drop_rand)
+
+        result = {}
+        for k in k_values:
+            tops   = accum[k]["top"]
+            rands  = accum[k]["rand"]
+            t_mean = float(np.mean(tops))  if tops  else 0.0
+            r_mean = float(np.mean(rands)) if rands else 0.0
+            ratio  = t_mean / (r_mean + 1e-8)
+            result[f"k{k}_top_conf_drop"]    = t_mean
+            result[f"k{k}_random_conf_drop"] = r_mean
+            result[f"k{k}_ratio"]            = ratio
+        return result
+
+    @staticmethod
+    def stability_check(model, loader, device, n_batches: int = 5) -> dict:
+        """
+        Determinism check: run forward pass twice on the same batches (model.eval(),
+        no dropout). Compute mean cosine similarity between the two M_t maps per video.
+
+        Returns:
+            {"stability_cosine_mean": float, "stability_cosine_min": float}
+
+        Expected ~1.0 for a deterministic intrinsic attention mechanism.
+        Low values indicate stochasticity (dropout not disabled, or non-deterministic ops).
+        """
+        import numpy as np
+        import torch.nn.functional as F
+
+        model.eval()
+        cos_sims = []
+
+        with torch.no_grad():
+            for i, batch in enumerate(loader):
+                if i >= n_batches:
+                    break
+                frames = batch["frames"].to(device)
+                B      = frames.shape[0]
+
+                out1 = model(frames)
+                out2 = model(frames)
+
+                M1 = out1.M_t.cpu().reshape(B, -1)  # (B, T*h*w)
+                M2 = out2.M_t.cpu().reshape(B, -1)
+
+                M1 = F.normalize(M1, dim=-1)
+                M2 = F.normalize(M2, dim=-1)
+
+                cos = (M1 * M2).sum(dim=-1).tolist()   # (B,)
+                cos_sims.extend(cos)
+
+        if not cos_sims:
+            return {"stability_cosine_mean": 1.0, "stability_cosine_min": 1.0}
+
+        return {
+            "stability_cosine_mean": float(np.mean(cos_sims)),
+            "stability_cosine_min":  float(np.min(cos_sims)),
         }

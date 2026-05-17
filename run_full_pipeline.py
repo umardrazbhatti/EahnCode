@@ -30,14 +30,17 @@ def main():
     args   = parse_args()
     config = EAHNConfig.from_args(args)
     os.makedirs(config.output_dir, exist_ok=True)
-    print(f"Output directory:    {config.output_dir}")
-    print(f"Device:              {config.device}")
-    print(f"Dataset:             {config.dataset_name}")
-    print(f"resume_checkpoint:   {config.resume_checkpoint or '(none)'}")
-    print(f"skip_eval:           {config.skip_eval}")
+    print(f"Output directory:        {config.output_dir}")
+    print(f"Device:                  {config.device}")
+    print(f"Dataset:                 {config.dataset_name}")
+    print(f"Active manipulation:     {config.active_manipulation}")
+    print(f"resume_checkpoint:       {config.resume_checkpoint or '(none)'}")
+    print(f"skip_eval:               {config.skip_eval}")
+    print(f"celebdf_eval:            {config.celebdf_eval}")
+    print(f"celebdf_root:            {config.celebdf_root or '(none)'}")
+    print(f"save_last_checkpoint:    {config.save_last_checkpoint}")
+    print(f"explanation_suite:       {config.explanation_suite}")
 
-    # --skip_eval suppresses the post-training evaluation pass entirely.
-    # Propagate by disabling eval_after_train before handing config to train_main.
     if config.skip_eval:
         config.eval_after_train = False
         print("[run_full_pipeline] --skip_eval set, skipping evaluation.")

@@ -215,13 +215,11 @@ def main(config: EAHNConfig):
         for batch_idx, batch in enumerate(train_loader):
             frames   = batch["frames"].to(device, non_blocking=True)
             labels   = batch["label"].to(device, non_blocking=True)
-            masks    = batch["mask"].to(device, non_blocking=True)
-            has_mask = batch["has_mask"].to(device, non_blocking=True)
 
             with autocast(_dev_str, enabled=_use_amp, dtype=_amp_dtype):
                 out      = model(frames)
                 l_cls    = cls_loss_fn(out.logit, labels)
-                exp_out  = exp_loss_fn(out.M_t, masks, has_mask)
+                exp_out  = exp_loss_fn(out.M_t)
                 l_exp    = exp_out.loss
                 l_temp   = temp_loss_fn(out.M_t, out.low_level)
                 _global_step = (epoch - 1) * len(train_loader) + batch_idx
@@ -379,25 +377,23 @@ def main(config: EAHNConfig):
             print(f"--> Best model saved ({SELECTION_KEY}: {best_metric:.4f}, "
                   f"val_auc_roc={metrics['auc_roc']:.4f})")
 
-        # ── Always save last_checkpoint.pth (atomic, for multi-session resume) ──
-        # Written to a .tmp file first then os.replace() so a kernel kill
-        # mid-save never corrupts the checkpoint.
-        _last_path = os.path.join(config.output_dir, "last_checkpoint.pth")
-        _last_tmp  = _last_path + ".tmp"
-        torch.save(
-            {
-                "epoch":                epoch,           # 1-indexed, already completed
-                "model_state_dict":     model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "best_metric":          best_metric,
-                "config":               _dataclasses.asdict(config),
-            },
-            _last_tmp,
-        )
-        os.replace(_last_tmp, _last_path)
-        print(f"[Checkpoint] last_checkpoint.pth saved  "
-              f"(epoch={epoch}, best_metric={best_metric:.4f})")
+        if config.save_last_checkpoint:
+            _last_path = os.path.join(config.output_dir, "last_checkpoint.pth")
+            _last_tmp  = _last_path + ".tmp"
+            torch.save(
+                {
+                    "epoch":                epoch,
+                    "model_state_dict":     model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "best_metric":          best_metric,
+                    "config":               _dataclasses.asdict(config),
+                },
+                _last_tmp,
+            )
+            os.replace(_last_tmp, _last_path)
+            print(f"[Checkpoint] last_checkpoint.pth saved  "
+                  f"(epoch={epoch}, best_metric={best_metric:.4f})")
 
     logger.close()
     print(f"\nTraining complete. Best balanced_accuracy_at_optimal: {best_metric:.4f}")
